@@ -22,15 +22,30 @@
       border-radius: 4px;
       margin-top: 10px;
     }
+    button {
+      background-color: #4285f4;
+      color: white;
+      border: none;
+      padding: 8px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      margin-top: 10px;
+    }
+    button:hover {
+      background-color: #3367d6;
+    }
   </style>
 </head>
 <body>
   <h1>AI Tab Grouper</h1>
   <p>Your AI-powered tab grouping assistant is running.</p>
   <div class="status">
-    <p><strong>Status:</strong> Monitoring tabs...</p>
-    <p>Open new tabs to see grouping in action!</p>
+    <p><strong>Status:</strong> Active</p>
+    <p>Current window has <span id="tabCount">0</span> tabs</p>
+    <p>and <span id="groupCount">0</span> groups</p>
   </div>
+  <button id="refreshBtn">Refresh Stats</button>
+  <button id="testBtn">Test Grouping</button>
   <script src="popup.js"></script>
 </body>
 </html>
