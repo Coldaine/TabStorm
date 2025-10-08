@@ -131,6 +131,14 @@ class AITabGrouper {
     this.temperature = 0.3; // Default sampling temperature
     this.debounceDelay = 750; // ms before running grouping after updates
     this.analysisTimers = new Map(); // Track pending tab analyses
+
+    // Batch processing properties
+    this.pendingTabs = new Map();
+    this.batchTimer = null;
+    this.batchDelay = 2000; // 2 seconds for batching
+
+    // Notification action mapping
+    this.notificationActions = new Map();
     
     // Rate limiting properties
     this.apiCallHistory = []; // Track API calls with timestamps
@@ -186,41 +194,86 @@ class AITabGrouper {
         clearTimeout(timer);
         this.analysisTimers.delete(tabId);
       }
+      // Also remove from pending batch
+      if (this.pendingTabs.has(tabId)) {
+        this.pendingTabs.delete(tabId);
+        console.log(`Tab ${tabId} removed from pending batch.`);
+      }
+    });
+
+    // Monitor notification clicks
+    chrome.notifications.onClicked.addListener((notificationId) => {
+      this.handleNotificationClick(notificationId);
     });
   }
 
   scheduleTabAnalysis(tab) {
-    if (!tab || typeof tab.id === 'undefined') {
+    if (!tab || typeof tab.id === 'undefined' || !this.isProcessableTab(tab)) {
       return;
     }
 
-    if (!this.isProcessableTab(tab)) {
+    // Add tab to the pending batch
+    this.pendingTabs.set(tab.id, tab);
+    console.log(`Tab ${tab.id} added to batch. Pending tabs: ${this.pendingTabs.size}`);
+
+    // If a batch timer is already running, clear it to reset the delay
+    if (this.batchTimer) {
+      clearTimeout(this.batchTimer);
+    }
+
+    // Schedule the batch processing
+    this.batchTimer = setTimeout(() => {
+      this.processPendingTabs();
+    }, this.batchDelay);
+  }
+
+  async processPendingTabs() {
+    if (this.pendingTabs.size === 0) {
       return;
     }
 
-    const existingTimer = this.analysisTimers.get(tab.id);
-    if (existingTimer) {
-      clearTimeout(existingTimer);
-    }
+    // Create a copy of the tabs to process and clear the pending map
+    const tabsToProcess = Array.from(this.pendingTabs.values());
+    this.pendingTabs.clear();
+    this.batchTimer = null;
 
-    const timer = setTimeout(async () => {
-      this.analysisTimers.delete(tab.id);
+    console.log(`Processing batch of ${tabsToProcess.length} tabs.`);
+
+    // Filter out any tabs that might have been closed or are no longer processable
+    const validTabs = [];
+    for (const tab of tabsToProcess) {
       try {
         const latestTabState = await chrome.tabs.get(tab.id);
-        if (this.isProcessableTab(latestTabState)) {
-          await this.analyzeAndGroupTab(latestTabState);
+        if (this.isProcessableTab(latestTabState) && this.isUngrouped(latestTabState)) {
+          validTabs.push(latestTabState);
         }
-      } catch (error) {
-        // Tab might have been closed before the timeout fired
-        if (error?.message?.includes('No tab with id')) {
-          console.debug(`Tab ${tab.id} closed before analysis could run.`);
-        } else {
-          console.error('Error during scheduled tab analysis:', error);
-        }
+      } catch (e) {
+        console.debug(`Tab ${tab.id} no longer exists, removing from batch.`);
       }
-    }, this.debounceDelay);
+    }
 
-    this.analysisTimers.set(tab.id, timer);
+    if (validTabs.length > 0) {
+      await this.analyzeAndGroupTabs(validTabs);
+    }
+  }
+
+  async handleNotificationClick(notificationId) {
+    const action = this.notificationActions.get(notificationId);
+    if (action) {
+      console.log(`Notification ${notificationId} clicked, executing grouping action.`);
+      try {
+        // The action contains the tab(s) and the grouping decision
+        await this.executeGrouping(action.tabs, action.decision);
+      } catch (error) {
+        console.error('Error executing grouping from notification click:', error);
+      } finally {
+        // Clean up the stored action and the notification itself
+        this.notificationActions.delete(notificationId);
+        chrome.notifications.clear(notificationId);
+      }
+    } else {
+      console.log(`No action found for clicked notification: ${notificationId}`);
+    }
   }
 
   isProcessableTab(tab) {
@@ -346,114 +399,112 @@ class AITabGrouper {
     return null;
   }
 
-  async analyzeAndGroupTab(tab) {
+  async analyzeAndGroupTabs(tabs) {
+    if (!tabs || tabs.length === 0) {
+      return;
+    }
+    const primaryTab = tabs[0];
     let tabsInWindow = [];
     let groupsInWindow = [];
 
     try {
-      console.log(`Analyzing tab: ${tab.title} (${tab.url})`);
+      console.log(`Analyzing batch of ${tabs.length} tabs, starting with: ${primaryTab.title} (${primaryTab.url})`);
 
-      if (!this.isProcessableTab(tab)) {
-        return;
-      }
-      
-      // Check grouping mode and paused state
       const settings = await chrome.storage.sync.get(['groupingMode', 'groupingPaused']);
       const groupingMode = settings.groupingMode || 'auto';
       const groupingPaused = settings.groupingPaused || false;
-      
-      // Skip grouping if paused or disabled
+
       if (groupingPaused || groupingMode === 'disabled') {
-        console.log(`Grouping is ${groupingPaused ? 'paused' : 'disabled'}, skipping tab ${tab.id}`);
+        console.log(`Grouping is ${groupingPaused ? 'paused' : 'disabled'}, skipping batch.`);
         return;
       }
-      
-      // Skip if tab is already in a group
-      if (!this.isUngrouped(tab)) {
-        console.log(`Tab ${tab.id} is already in a group (ID: ${tab.groupId}), skipping.`);
-        return;
-      }
-      
-      // Get all tabs in the same window
-      tabsInWindow = await chrome.tabs.query({ windowId: tab.windowId });
-      console.log(`Found ${tabsInWindow.length} tabs in window ${tab.windowId}`);
-      
-      // Get existing groups in the same window
-      groupsInWindow = await chrome.tabGroups.query({ windowId: tab.windowId });
-      console.log(`Found ${groupsInWindow.length} existing groups in window ${tab.windowId}`);
-      
-      // For 'manual' mode, we might want to notify user instead of auto-grouping
-      if (groupingMode === 'manual') {
-        console.log(`Manual mode: Tab ${tab.id} could be grouped, but waiting for user action`);
-        // Could send a notification to user here
-        return;
-      }
-      
-      // Extract content from the current tab
-      let tabContent = null;
-      try {
-        // Execute content script to extract page content
-        const contentResults = await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          func: () => {
-            // This function will run in the content script context
-            return {
+
+      tabsInWindow = await chrome.tabs.query({ windowId: primaryTab.windowId });
+      groupsInWindow = await chrome.tabGroups.query({ windowId: primaryTab.windowId });
+
+      const tabsContent = [];
+      for (const tab of tabs) {
+        try {
+          const contentResults = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: () => ({
               title: document.title,
               description: document.querySelector('meta[name="description"]')?.content || '',
               headings: Array.from(document.querySelectorAll('h1, h2, h3')).map(el => el.textContent.trim()),
               url: window.location.href,
               hostname: window.location.hostname
-            };
+            })
+          });
+          if (contentResults && contentResults[0] && contentResults[0].result) {
+            tabsContent.push(contentResults[0].result);
+          } else {
+            tabsContent.push(null);
           }
-        });
-        
-        // Get the result from the content script execution
-        if (contentResults && contentResults[0] && contentResults[0].result) {
-          tabContent = contentResults[0].result;
-        } else {
-          console.log(`Could not extract content from tab ${tab.id}, using basic info only`);
-          tabContent = null;
+        } catch (contentError) {
+          console.log(`Content script execution failed for tab ${tab.id}:`, contentError.message);
+          tabsContent.push(null);
         }
-      } catch (contentError) {
-        console.log(`Content script execution failed for tab ${tab.id}:`, contentError.message);
-        // Continue with basic info if content script fails
-        tabContent = null;
       }
-      
-      // Call the LLM for grouping decision with content if available
-      const groupDecision = await this.callLLMForGrouping(tab, tabsInWindow, groupsInWindow, tabContent);
-      
+
+      const groupDecision = await this.callLLMForGrouping(tabs, tabsInWindow, groupsInWindow, tabsContent);
+
+      if (groupingMode === 'manual') {
+        if (groupDecision.shouldGroup) {
+          console.log(`Manual mode: Sending notification for grouping suggestion.`);
+          await this.sendGroupingNotification(tabs, groupDecision);
+        } else {
+          console.log(`Manual mode: LLM decided not to group, no notification sent.`);
+        }
+        return;
+      }
+
       if (groupDecision.shouldGroup) {
-        await this.executeGrouping(tab, groupDecision);
+        await this.executeGrouping(tabs, groupDecision);
       } else {
-        console.log(`Tab ${tab.id} should not be grouped according to LLM decision.`);
+        console.log(`Batch of ${tabs.length} tabs should not be grouped according to LLM.`);
       }
     } catch (error) {
-      console.error('Error during tab analysis and grouping:', error);
-      
-      // Fallback to static rules if primary method fails
+      console.error('Error during batch tab analysis and grouping:', error);
+      // Fallback for the first tab in the batch for simplicity
       try {
-        const fallbackDecision = await this.classifyTab(tab, tabsInWindow, groupsInWindow);
+        const fallbackDecision = await this.classifyTab(primaryTab, tabsInWindow, groupsInWindow);
         if (fallbackDecision.shouldGroup) {
-          await this.executeGrouping(tab, fallbackDecision);
+          await this.executeGrouping([primaryTab], fallbackDecision);
         }
       } catch (fallbackError) {
         console.error('Error during fallback classification:', fallbackError);
-        // As a last resort, we can simply log the error and continue
-        console.log(`Tab ${tab.id} will remain ungrouped due to errors:`, error.message);
       }
     }
   }
 
+  async sendGroupingNotification(tabs, decision) {
+    const tabCount = tabs.length;
+    const groupName = decision.groupName || 'a new group';
+    const notificationId = `group-suggestion-${Date.now()}`;
+
+    // Store the action to be taken if the user clicks the notification
+    this.notificationActions.set(notificationId, { tabs, decision });
+
+    await chrome.notifications.create(notificationId, {
+      type: 'basic',
+      iconUrl: 'icons/icon128.png',
+      title: 'Tab Grouping Suggestion',
+      message: `Group ${tabCount} tab${tabCount > 1 ? 's' : ''} into "${groupName}"?`,
+      priority: 2
+    });
+
+    console.log(`Sent notification ${notificationId} for grouping ${tabCount} tabs into "${groupName}".`);
+  }
+
   // New method: Call LLM API for grouping decision
-  async callLLMForGrouping(tab, allTabs, existingGroups, tabContent = null) {
+  async callLLMForGrouping(tabs, allTabs, existingGroups, tabsContent = []) {
     if (this.useMock) {
-      // Use mock response for testing
-      return this.getMockGroupingResponse(tab, allTabs, existingGroups);
+      // Use mock response for testing (with the first tab for simplicity)
+      return this.getMockGroupingResponse(tabs[0], allTabs, existingGroups);
     }
     
     // Build prompt for the LLM with content information
-    const prompt = this.buildGroupingPrompt(tab, allTabs, existingGroups, tabContent);
+    const prompt = this.buildGroupingPrompt(tabs, allTabs, existingGroups, tabsContent);
     
     try {
       // Call OpenAI, Claude, or other API
@@ -512,18 +563,18 @@ class AITabGrouper {
   }
 
   // Build the prompt to send to the LLM
-  buildGroupingPrompt(tab, allTabs, existingGroups, tabContent = null) {
-    const tabInfo = {
-      url: tab.url,
-      title: tab.title,
-      domain: new URL(tab.url).hostname,
-      // Extract additional context from the URL
-      pathname: new URL(tab.url).pathname,
-      search: new URL(tab.url).search
-    };
+  buildGroupingPrompt(tabs, allTabs, existingGroups, tabsContent = []) {
+    const newTabsInfo = tabs.map((tab, index) => {
+      const tabContent = tabsContent[index];
+      let contentDescription = "No additional content available";
+      if (tabContent) {
+        contentDescription = `Page Title: "${tabContent.title}"; Description: "${tabContent.description || 'N/A'}"; Headings: [${tabContent.headings?.slice(0, 3).join(', ') || 'N/A'}]`;
+      }
+      return `- URL: ${tab.url}\n  Title: "${tab.title}"\n  Content: ${contentDescription}`;
+    }).join('\n');
 
     const existingTabInfo = allTabs
-      .filter(t => t.id !== tab.id) // Exclude the current tab from existing tabs
+      .filter(t => !tabs.some(newTab => newTab.id === t.id)) // Exclude the new tabs
       .map(t => ({
         title: t.title,
         domain: new URL(t.url).hostname,
@@ -536,27 +587,11 @@ class AITabGrouper {
       color: g.color
     }));
 
-    let contentDescription = "No additional content available";
-    if (tabContent) {
-      contentDescription = `
-Page Title: "${tabContent.title}"
-Meta Description: "${tabContent.description}"
-Headings: [${tabContent.headings && tabContent.headings.length > 0 ? tabContent.headings.slice(0, 5).join(', ') : 'No headings found'}]
-Hostname: ${tabContent.hostname}
-`;
-    }
-
     return `
-You are an intelligent tab grouping assistant. Analyze the new tab and determine the best way to organize it with other tabs.
+You are an intelligent tab grouping assistant. Analyze a batch of new tabs and determine if they should be grouped.
 
-NEW TAB TO ANALYZE:
-- Title: "${tabInfo.title}"
-- URL: ${tabInfo.url}
-- Domain: ${tabInfo.domain}
-- Path: ${tabInfo.pathname}
-
-PAGE CONTENT ANALYSIS:
-${contentDescription}
+NEW TABS TO ANALYZE (${tabs.length} total):
+${newTabsInfo}
 
 EXISTING TABS IN THE SAME WINDOW:
 ${existingTabInfo.length > 0 
@@ -569,39 +604,35 @@ ${existingGroupInfo.length > 0
   : 'No existing groups in this window'}
 
 TASK:
-Analyze the content, domain, and purpose of the new tab. Decide if it should be grouped with existing tabs or if it needs its own group.
+Analyze the batch of new tabs. Decide if they share a common theme and should be grouped together.
+- If they should be grouped, suggest a single new group for all of them or suggest adding them to an existing group.
+- All tabs in the batch will be placed in the SAME group if a grouping decision is made.
 
-Consider the page content analysis when making your decision, as it provides more context than just the URL.
-
-If there's an existing group with similar content, suggest using that group (provide the exact group ID).
-If the tab is unique or doesn't fit existing groups, suggest creating a new group.
-
-When creating new groups, use creative, descriptive, and specific names that accurately represent the content/website purpose. Avoid generic names like "General" or "Other".
-
-Group name suggestions: Shopping, Social Media, News & Updates, Entertainment, Work & Productivity, Learning & Education, Finance & Banking, Health & Fitness, Travel & Maps, etc.
+When creating new groups, use creative, descriptive names. Avoid generic names.
 
 COLOR SELECTION GUIDELINES:
 - Red: Social Media, Entertainment
 - Blue: Work, Communication, Productivity
-- Green: Nature, Health, Finance, Environment
-- Yellow: News, Alerts, Notifications
-- Purple: Creative, Art, Design, Lifestyle
-- Orange: Shopping, Deals, Food
+- Green: Nature, Health, Finance
+- Yellow: News, Alerts
+- Purple: Creative, Art, Design
+- Orange: Shopping, Food
 - Pink: Fashion, Beauty, Lifestyle
-- Cyan: Technology, Science, Information
+- Cyan: Technology, Science
 
-IMPORTANT: Respond with only valid JSON in the following exact format:
+IMPORTANT: Respond with only valid JSON in the following exact format.
+If the tabs share a theme and should be grouped:
 {
   "shouldGroup": true,
-  "groupName": "Specific and descriptive group name",
+  "groupName": "Specific and descriptive group name for the batch",
   "color": "blue",
-  "existingGroupId": null (to create new) or existing group ID (like 123) to add to existing group,
-  "reasoning": "Brief explanation of why this tab should be grouped this way"
+  "existingGroupId": null (to create a new group) or an existing group ID (e.g., 123),
+  "reasoning": "Brief explanation of why these tabs belong together in this group."
 }
-If you cannot make a good grouping decision, respond with:
+If the tabs do not share a common theme or should not be grouped:
 {
   "shouldGroup": false,
-  "reasoning": "Brief explanation of why grouping is not appropriate"
+  "reasoning": "Brief explanation of why grouping is not appropriate for this batch."
 }
 `;
   }
@@ -660,111 +691,143 @@ If you cannot make a good grouping decision, respond with:
     const model = this.resolveModel(provider);
     const temperature = typeof this.temperature === 'number' ? this.temperature : 0.3;
 
-    try {
-      let apiUrl = '';
-      const headers = {
-        'Content-Type': 'application/json'
-      };
-      let bodyPayload = {};
+    const maxRetries = 3;
+    let lastError = null;
 
-      switch (provider) {
-        case 'openai': {
-          const endpointBase = baseUrl || providerDefaults.openai.baseUrl;
-          apiUrl = `${endpointBase}/chat/completions`;
-          headers['Authorization'] = `Bearer ${apiKey}`;
-          bodyPayload = {
-            model: model || providerDefaults.openai.defaultModel,
-            messages: [{ role: 'user', content: prompt }],
-            max_tokens: 150,
-            temperature
-          };
-          break;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        if (attempt > 0) {
+          const delay = Math.pow(2, attempt - 1) * 1000; // 1s, 2s, 4s
+          console.log(`[AITabGrouper] LLM call failed. Retrying attempt ${attempt + 1}/${maxRetries + 1} in ${delay / 1000}s...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
         }
-        case 'anthropic': {
-          const endpointBase = baseUrl || providerDefaults.anthropic.baseUrl;
-          apiUrl = `${endpointBase}/messages`;
-          headers['x-api-key'] = apiKey;
-          headers['anthropic-version'] = '2023-06-01';
-          bodyPayload = {
-            model: model || providerDefaults.anthropic.defaultModel,
-            max_tokens: 150,
-            messages: [{ role: 'user', content: prompt }]
-          };
-          break;
-        }
-        case 'gemini': {
-          const endpointBase = baseUrl || providerDefaults.gemini.baseUrl;
-          apiUrl = `${endpointBase}/models/${encodeURIComponent(model || providerDefaults.gemini.defaultModel)}:generateContent`;
-          headers['x-goog-api-key'] = apiKey;
-          bodyPayload = {
-            contents: [
-              {
-                role: 'user',
-                parts: [{ text: prompt }]
-              }
-            ]
-          };
-          break;
-        }
-        case 'zai': {
-          const endpointBase = baseUrl || providerDefaults.zai.baseUrl;
-          apiUrl = `${endpointBase}/chat/completions`;
-          headers['Authorization'] = `Bearer ${apiKey}`;
-          bodyPayload = {
-            model: model || providerDefaults.zai.defaultModel,
-            messages: [{ role: 'user', content: prompt }],
-            max_tokens: 150,
-            temperature
-          };
-          break;
-        }
-        case 'custom': {
-          const endpointBase = baseUrl || providerDefaults.custom.baseUrl;
-          if (!endpointBase) {
-            throw new Error('Custom provider selected but no base URL configured.');
+
+        let apiUrl = '';
+        const headers = {
+          'Content-Type': 'application/json'
+        };
+        let bodyPayload = {};
+
+        switch (provider) {
+          case 'openai': {
+            const endpointBase = baseUrl || providerDefaults.openai.baseUrl;
+            apiUrl = `${endpointBase}/chat/completions`;
+            headers['Authorization'] = `Bearer ${apiKey}`;
+            bodyPayload = {
+              model: model || providerDefaults.openai.defaultModel,
+              messages: [{ role: 'user', content: prompt }],
+              max_tokens: 150,
+              temperature
+            };
+            break;
           }
-          apiUrl = `${endpointBase}/chat/completions`;
-          headers['Authorization'] = `Bearer ${apiKey}`;
-          bodyPayload = {
-            model: model || providerDefaults.custom.defaultModel || 'gpt-3.5-turbo',
-            messages: [{ role: 'user', content: prompt }],
-            max_tokens: 150,
-            temperature
-          };
-          break;
+          case 'anthropic': {
+            const endpointBase = baseUrl || providerDefaults.anthropic.baseUrl;
+            apiUrl = `${endpointBase}/messages`;
+            headers['x-api-key'] = apiKey;
+            headers['anthropic-version'] = '2023-06-01';
+            bodyPayload = {
+              model: model || providerDefaults.anthropic.defaultModel,
+              max_tokens: 150,
+              messages: [{ role: 'user', content: prompt }]
+            };
+            break;
+          }
+          case 'gemini': {
+            const endpointBase = baseUrl || providerDefaults.gemini.baseUrl;
+            apiUrl = `${endpointBase}/models/${encodeURIComponent(model || providerDefaults.gemini.defaultModel)}:generateContent`;
+            headers['x-goog-api-key'] = apiKey;
+            bodyPayload = {
+              contents: [
+                {
+                  role: 'user',
+                  parts: [{ text: prompt }]
+                }
+              ]
+            };
+            break;
+          }
+          case 'zai': {
+            const endpointBase = baseUrl || providerDefaults.zai.baseUrl;
+            apiUrl = `${endpointBase}/chat/completions`;
+            headers['Authorization'] = `Bearer ${apiKey}`;
+            bodyPayload = {
+              model: model || providerDefaults.zai.defaultModel,
+              messages: [{ role: 'user', content: prompt }],
+              max_tokens: 150,
+              temperature
+            };
+            break;
+          }
+          case 'custom': {
+            const endpointBase = baseUrl || providerDefaults.custom.baseUrl;
+            if (!endpointBase) {
+              throw new Error('Custom provider selected but no base URL configured.');
+            }
+            apiUrl = `${endpointBase}/chat/completions`;
+            headers['Authorization'] = `Bearer ${apiKey}`;
+            bodyPayload = {
+              model: model || providerDefaults.custom.defaultModel || 'gpt-3.5-turbo',
+              messages: [{ role: 'user', content: prompt }],
+              max_tokens: 150,
+              temperature
+            };
+            break;
+          }
+          default: {
+            throw new Error(`Unsupported provider: ${provider}`);
+          }
         }
-        default: {
-          throw new Error(`Unsupported provider: ${provider}`);
+
+        apiUrl = apiUrl.replace(/([^:]\/)\/+/g, '$1');
+
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(bodyPayload)
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text().catch(() => '');
+          const error = new Error(`LLM ${provider} request failed with status ${response.status}: ${errorText.slice(0, 300)}`);
+          error.status = response.status;
+          throw error;
+        }
+
+        const data = await response.json();
+        const content = this.normalizeProviderResponse(provider, data);
+
+        if (!content) {
+          console.debug('[AITabGrouper] Unable to extract response content from provider', { provider, data });
+          return null;
+        }
+
+        return content; // Success
+      } catch (error) {
+        lastError = error;
+        console.error(`[AITabGrouper] LLM API call attempt ${attempt + 1} failed:`, error.message);
+
+        // Non-retriable auth errors
+        if (error.status === 401 || error.status === 403) {
+          console.error(`[AITabGrouper] Authentication error (${error.status}). Aborting retries.`);
+          break; // Exit loop immediately
+        }
+        
+        // Log retriable errors
+        if (error.status === 429) {
+          console.warn(`[AITabGrouper] Rate limit error (429) from provider ${provider}.`);
+        } else if (error.status >= 500) {
+          console.warn(`[AITabGrouper] Server error (${error.status}) from provider ${provider}.`);
+        } else if (!error.status) {
+          console.warn(`[AITabGrouper] Network error during fetch for provider ${provider}.`);
         }
       }
-
-      apiUrl = apiUrl.replace(/([^:]\/)\/+/g, '$1');
-
-      const response = await fetch(apiUrl, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(bodyPayload)
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text().catch(() => '');
-        throw new Error(`LLM ${provider} request failed with status ${response.status}: ${errorText.slice(0, 300)}`);
-      }
-
-      const data = await response.json();
-      const content = this.normalizeProviderResponse(provider, data);
-
-      if (!content) {
-        console.debug('[AITabGrouper] Unable to extract response content from provider', { provider, data });
-        return null;
-      }
-
-      return content;
-    } catch (error) {
-      console.error('Error calling LLM API:', error);
-      this.apiCallHistory.pop(); // Remove the failed call from history
-      throw error;
     }
+
+    // If we exit the loop, all retries have failed.
+    console.error(`[AITabGrouper] LLM API call failed after ${maxRetries + 1} attempts.`);
+    this.apiCallHistory.pop(); // Remove the failed call from history
+    throw lastError; // Throw the last captured error
   }
 
   // Parse the LLM response
@@ -907,36 +970,33 @@ If you cannot make a good grouping decision, respond with:
     }
   }
 
-  async executeGrouping(tab, decision) {
+  async executeGrouping(tabs, decision) {
+    if (!tabs || tabs.length === 0) {
+      return;
+    }
+    const tabIds = tabs.map(t => t.id);
     let groupId;
-    
+
     if (decision.existingGroupId) {
       // Add to existing group
-      console.log(`Adding tab ${tab.id} to existing group ${decision.existingGroupId}`);
+      console.log(`Adding ${tabIds.length} tabs to existing group ${decision.existingGroupId}`);
       groupId = decision.existingGroupId;
-      
-      // Add the tab to the existing group
       await chrome.tabs.group({
-        tabIds: [tab.id],
+        tabIds: tabIds,
         groupId: groupId
       });
     } else {
       // Create new group
-      console.log(`Creating new group for tab ${tab.id}`);
-      groupId = await chrome.tabs.group({ tabIds: [tab.id] });
-    }
-    
-    // Update group with rule-based name and properties if it's a new group
-    // or if it's not already named according to our rules
-    if (!decision.existingGroupId) {
+      console.log(`Creating new group for ${tabIds.length} tabs.`);
+      groupId = await chrome.tabs.group({ tabIds: tabIds });
       await chrome.tabGroups.update(groupId, {
         title: decision.groupName,
         color: decision.color || 'grey'
       });
-      console.log(`Updated group ${groupId} with title "${decision.groupName}" and color "${decision.color}"`);
+      console.log(`Updated new group ${groupId} with title "${decision.groupName}" and color "${decision.color}"`);
     }
     
-    console.log(`Successfully grouped tab ${tab.id} into group ${groupId}`);
+    console.log(`Successfully grouped ${tabIds.length} tabs into group ${groupId}`);
   }
 }
 
