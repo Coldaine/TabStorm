@@ -1,28 +1,74 @@
 // background.js
 console.log("AI Tab Grouper background service worker loaded");
 
-// Initialize the AI Tab Grouper
-const tabGrouper = new AITabGrouper();
-async function initializeTabGrouper() {
-  // Load settings from storage
-  const settings = await chrome.storage.sync.get(['apiKey', 'llmProvider']);
-  if (settings.apiKey) {
-    tabGrouper.apiKey = settings.apiKey;
-    tabGrouper.useMock = false;
-  } else {
-    tabGrouper.useMock = true; // Use mock if no API key is provided
+// Will be instantiated after the class declaration
+let tabGrouper = null;
+
+const getEnv = () =>
+  (typeof process !== 'undefined' && process?.env) ? process.env : {};
+
+const trimTrailingSlashes = (value = '') => value.replace(/\/+$/, '');
+
+const providerDefaults = {
+  openai: {
+    baseUrl: trimTrailingSlashes(getEnv().OPENAI_API_BASE || 'https://api.openai.com/v1'),
+    defaultModel: 'gpt-3.5-turbo',
+    normalize: (data) => data?.choices?.[0]?.message?.content ?? null
+  },
+  anthropic: {
+    baseUrl: trimTrailingSlashes(getEnv().ANTHROPIC_API_BASE || 'https://api.anthropic.com/v1'),
+    defaultModel: 'claude-3-haiku-20240307',
+    normalize: (data) => data?.content?.[0]?.text ?? null
+  },
+  gemini: {
+    baseUrl: trimTrailingSlashes(getEnv().GEMINI_API_BASE || 'https://generativelanguage.googleapis.com/v1'),
+    defaultModel: 'gemini-1.5-flash',
+    normalize: (data) => {
+      const parts = data?.candidates?.[0]?.content?.parts || [];
+      const texts = parts.map(part => part?.text).filter(Boolean);
+      return texts.length ? texts.join('\n') : null;
+    }
+  },
+  zai: {
+    baseUrl: trimTrailingSlashes(getEnv().ZAI_BASE_URL || getEnv().Z_AI_BASE_URL || 'https://api.z.ai/api/paas/v4'),
+    defaultModel: 'glm-4.6',
+    normalize: (data) => data?.choices?.[0]?.message?.content ?? null
+  },
+  custom: {
+    baseUrl: trimTrailingSlashes(getEnv().CUSTOM_API_URL || ''),
+    normalize: (data) => data?.choices?.[0]?.message?.content ?? null
   }
-  if (settings.llmProvider) {
-    tabGrouper.llmProvider = settings.llmProvider;
-  }
-}
+};
+
+const envKeyNotified = new Set();
 
 // Handle messages from popup and options page
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.action === 'probeEnvKey') {
+    const env = getEnv();
+    let present = false;
+    if (message.provider === 'gemini') {
+      present = Boolean(env.GEMINI_API_KEY || env.GOOGLE_API_KEY);
+    } else if (message.provider === 'zai') {
+      present = Boolean(env.ZAI_API_KEY || env.Z_AI_API_KEY);
+    }
+    sendResponse?.({ ok: true, present });
+    return true;
+  }
+
+  if (!tabGrouper) {
+    console.warn('Tab grouper not initialized yet; ignoring message:', message.action);
+    sendResponse?.({ status: 'Tab grouper not ready' });
+    return true;
+  }
+
   if (message.action === 'updateApiKey') {
-    tabGrouper.apiKey = message.apiKey;
-    tabGrouper.llmProvider = message.llmProvider;
-    tabGrouper.useMock = !message.apiKey; // Use mock if no API key is provided
+    tabGrouper.apiKey = message.apiKey || null;
+    if (message.llmProvider) {
+      tabGrouper.llmProvider = message.llmProvider;
+    }
+    const hasKey = tabGrouper.resolveApiKey(tabGrouper.llmProvider);
+    tabGrouper.useMock = !hasKey;
     console.log('API key updated from options page');
     sendResponse({status: 'API key updated'});
     return true; // Indicates we wish to send a response asynchronously
@@ -33,6 +79,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   } else if (message.action === 'updateLlmProvider') {
     tabGrouper.llmProvider = message.provider;
+    const hasKey = tabGrouper.resolveApiKey(tabGrouper.llmProvider);
+    tabGrouper.useMock = !hasKey;
     console.log('LLM provider updated to:', message.provider);
     sendResponse({status: 'LLM provider updated'});
     return true;
@@ -78,6 +126,11 @@ class AITabGrouper {
     this.llmProvider = 'openai'; // Default provider
     this.useMock = true; // Default to using mock responses during development
     this.groupingMode = 'auto'; // Default to automatic AI-powered grouping
+    this.model = null; // Allow provider-specific overrides in future
+    this.baseUrl = null; // Allow provider-specific base URL overrides
+    this.temperature = 0.3; // Default sampling temperature
+    this.debounceDelay = 750; // ms before running grouping after updates
+    this.analysisTimers = new Map(); // Track pending tab analyses
     
     // Rate limiting properties
     this.apiCallHistory = []; // Track API calls with timestamps
@@ -109,15 +162,14 @@ class AITabGrouper {
     // Monitor new tabs
     chrome.tabs.onCreated.addListener((tab) => {
       console.log('New tab created:', tab.id, tab.url);
-      // Handle new tab after it finishes loading
+      this.scheduleTabAnalysis(tab);
     });
     
     // Monitor tab updates (URL changes, loading completion)
-    chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+    chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       if (changeInfo.status === 'complete' && changeInfo.url) {
         console.log('Tab updated with new URL:', tab.url);
-        // At this point, the tab has finished loading with new content
-        await this.analyzeAndGroupTab(tab);
+        this.scheduleTabAnalysis(tab);
       }
     });
     
@@ -129,12 +181,181 @@ class AITabGrouper {
     // Monitor tab removal
     chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
       console.log('Tab removed:', tabId);
+      const timer = this.analysisTimers.get(tabId);
+      if (timer) {
+        clearTimeout(timer);
+        this.analysisTimers.delete(tabId);
+      }
     });
   }
 
+  scheduleTabAnalysis(tab) {
+    if (!tab || typeof tab.id === 'undefined') {
+      return;
+    }
+
+    if (!this.isProcessableTab(tab)) {
+      return;
+    }
+
+    const existingTimer = this.analysisTimers.get(tab.id);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+
+    const timer = setTimeout(async () => {
+      this.analysisTimers.delete(tab.id);
+      try {
+        const latestTabState = await chrome.tabs.get(tab.id);
+        if (this.isProcessableTab(latestTabState)) {
+          await this.analyzeAndGroupTab(latestTabState);
+        }
+      } catch (error) {
+        // Tab might have been closed before the timeout fired
+        if (error?.message?.includes('No tab with id')) {
+          console.debug(`Tab ${tab.id} closed before analysis could run.`);
+        } else {
+          console.error('Error during scheduled tab analysis:', error);
+        }
+      }
+    }, this.debounceDelay);
+
+    this.analysisTimers.set(tab.id, timer);
+  }
+
+  isProcessableTab(tab) {
+    if (!tab) {
+      return false;
+    }
+
+    if (tab.incognito) {
+      console.log(`Skipping incognito tab ${tab.id}`);
+      return false;
+    }
+
+    const url = tab.url || tab.pendingUrl;
+    if (!url) {
+      return false;
+    }
+
+    const disallowedProtocols = ['chrome:', 'edge:', 'about:', 'chrome-extension:', 'devtools:'];
+    if (disallowedProtocols.some((protocol) => url.startsWith(protocol))) {
+      console.log(`Skipping unsupported URL for tab ${tab.id}: ${url}`);
+      return false;
+    }
+
+    if (!/^https?:/i.test(url)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  isUngrouped(tab) {
+    return !tab.groupId || tab.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE;
+  }
+
+  resolveApiKey(provider) {
+    if (!provider) {
+      return null;
+    }
+
+    if (this.apiKey) {
+      if (typeof this.apiKey === 'object' && this.apiKey[provider]) {
+        return this.apiKey[provider];
+      }
+      if (typeof this.apiKey === 'string') {
+        return this.apiKey;
+      }
+    }
+
+    const env = getEnv();
+    let key = null;
+
+    switch (provider) {
+      case 'openai':
+        key = env.OPENAI_API_KEY || null;
+        break;
+      case 'anthropic':
+        key = env.ANTHROPIC_API_KEY || null;
+        break;
+      case 'gemini':
+        key = env.GEMINI_API_KEY || env.GOOGLE_API_KEY || null;
+        break;
+      case 'zai':
+        key = env.ZAI_API_KEY || env.Z_AI_API_KEY || null;
+        break;
+      case 'custom':
+        key = env.CUSTOM_API_KEY || null;
+        break;
+      default:
+        key = null;
+    }
+
+    if (key && !envKeyNotified.has(provider)) {
+      console.info(`[AITabGrouper] Using ${provider} API key from environment`);
+      envKeyNotified.add(provider);
+    }
+
+    return key;
+  }
+
+  resolveBaseUrl(provider) {
+    const defaults = providerDefaults[provider] || {};
+    let baseUrl = defaults.baseUrl || '';
+
+    if (this.baseUrl) {
+      if (typeof this.baseUrl === 'object' && this.baseUrl[provider]) {
+        baseUrl = this.baseUrl[provider];
+      } else if (typeof this.baseUrl === 'string' && this.baseUrl.trim() !== '') {
+        baseUrl = this.baseUrl;
+      }
+    }
+
+    return trimTrailingSlashes(baseUrl);
+  }
+
+  resolveModel(provider) {
+    const defaults = providerDefaults[provider] || {};
+
+    if (this.model) {
+      if (typeof this.model === 'object' && this.model[provider]) {
+        return this.model[provider];
+      }
+      if (typeof this.model === 'string' && this.model.trim() !== '') {
+        return this.model;
+      }
+    }
+
+    return defaults.defaultModel || 'gpt-3.5-turbo';
+  }
+
+  normalizeProviderResponse(provider, data) {
+    if (providerDefaults[provider]?.normalize) {
+      return providerDefaults[provider].normalize(data);
+    }
+
+    if (provider === 'openai' || provider === 'custom' || provider === 'zai') {
+      return data?.choices?.[0]?.message?.content ?? null;
+    }
+
+    if (provider === 'anthropic') {
+      return data?.content?.[0]?.text ?? null;
+    }
+
+    return null;
+  }
+
   async analyzeAndGroupTab(tab) {
+    let tabsInWindow = [];
+    let groupsInWindow = [];
+
     try {
       console.log(`Analyzing tab: ${tab.title} (${tab.url})`);
+
+      if (!this.isProcessableTab(tab)) {
+        return;
+      }
       
       // Check grouping mode and paused state
       const settings = await chrome.storage.sync.get(['groupingMode', 'groupingPaused']);
@@ -148,17 +369,17 @@ class AITabGrouper {
       }
       
       // Skip if tab is already in a group
-      if (tab.groupId && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
+      if (!this.isUngrouped(tab)) {
         console.log(`Tab ${tab.id} is already in a group (ID: ${tab.groupId}), skipping.`);
         return;
       }
       
       // Get all tabs in the same window
-      const tabsInWindow = await chrome.tabs.query({ windowId: tab.windowId });
+      tabsInWindow = await chrome.tabs.query({ windowId: tab.windowId });
       console.log(`Found ${tabsInWindow.length} tabs in window ${tab.windowId}`);
       
       // Get existing groups in the same window
-      const groupsInWindow = await chrome.tabGroups.query({ windowId: tab.windowId });
+      groupsInWindow = await chrome.tabGroups.query({ windowId: tab.windowId });
       console.log(`Found ${groupsInWindow.length} existing groups in window ${tab.windowId}`);
       
       // For 'manual' mode, we might want to notify user instead of auto-grouping
@@ -236,8 +457,11 @@ class AITabGrouper {
     
     try {
       // Call OpenAI, Claude, or other API
-      const response = await this.callExternalLLM(prompt);
-      const parsedResponse = this.parseLLMResponse(response);
+      const responseText = await this.callExternalLLM(prompt);
+      if (!responseText) {
+        throw new Error(`LLM provider ${this.llmProvider} returned no usable content`);
+      }
+      const parsedResponse = this.parseLLMResponse(responseText);
       
       // Validate and enhance the response
       return this.validateGroupingResponse(parsedResponse, existingGroups);
@@ -269,7 +493,7 @@ class AITabGrouper {
       }
       
       // Validate color against allowed values
-      const validColors = ["red", "blue", "green", "yellow", "purple", "pink", "cyan", "orange"];
+      const validColors = ["red", "blue", "green", "yellow", "purple", "pink", "cyan", "orange", "grey"];
       if (!validColors.includes(response.color)) {
         response.color = "grey"; // Default to grey if invalid color is provided
       }
@@ -384,8 +608,15 @@ If you cannot make a good grouping decision, respond with:
 
   // Call external LLM API with rate limiting
   async callExternalLLM(prompt) {
-    if (!this.apiKey && !this.useMock) {
-      throw new Error('No API key configured for LLM');
+    if (!prompt) {
+      return null;
+    }
+
+    const provider = this.llmProvider || 'openai';
+    const apiKey = this.resolveApiKey(provider);
+    if (!apiKey) {
+      console.warn(`[AITabGrouper] No API key for provider=${provider}. Set it in options to enable AI grouping.`);
+      throw new Error(`Missing API key for provider ${provider}`);
     }
 
     // Check rate limiting
@@ -425,99 +656,109 @@ If you cannot make a good grouping decision, respond with:
     // Record this API call
     this.apiCallHistory.push(Date.now());
 
+    const baseUrl = this.resolveBaseUrl(provider);
+    const model = this.resolveModel(provider);
+    const temperature = typeof this.temperature === 'number' ? this.temperature : 0.3;
+
     try {
-      // Example for OpenAI API - would need to be customized based on the selected LLM service
-      let apiUrl, headers, body;
-      
-      switch(this.llmProvider) {
-        case 'openai':
-          apiUrl = 'https://api.openai.com/v1/chat/completions';
-          headers = {
-            'Authorization': `Bearer ${this.apiKey}`,
-            'Content-Type': 'application/json'
-          };
-          body = JSON.stringify({
-            model: 'gpt-3.5-turbo', // or gpt-4 if preferred
+      let apiUrl = '';
+      const headers = {
+        'Content-Type': 'application/json'
+      };
+      let bodyPayload = {};
+
+      switch (provider) {
+        case 'openai': {
+          const endpointBase = baseUrl || providerDefaults.openai.baseUrl;
+          apiUrl = `${endpointBase}/chat/completions`;
+          headers['Authorization'] = `Bearer ${apiKey}`;
+          bodyPayload = {
+            model: model || providerDefaults.openai.defaultModel,
             messages: [{ role: 'user', content: prompt }],
             max_tokens: 150,
-            temperature: 0.3
-          });
-          break;
-          
-        case 'anthropic':
-          apiUrl = 'https://api.anthropic.com/v1/messages';
-          headers = {
-            'x-api-key': this.apiKey,
-            'Content-Type': 'application/json',
-            'anthropic-version': '2023-06-01'
+            temperature
           };
-          body = JSON.stringify({
-            model: 'claude-3-haiku-20240307',
-            messages: [{ role: 'user', content: prompt }],
-            max_tokens: 150
-          });
           break;
-          
-        case 'gemini':
-          apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${this.apiKey}`;
-          headers = {
-            'Content-Type': 'application/json'
+        }
+        case 'anthropic': {
+          const endpointBase = baseUrl || providerDefaults.anthropic.baseUrl;
+          apiUrl = `${endpointBase}/messages`;
+          headers['x-api-key'] = apiKey;
+          headers['anthropic-version'] = '2023-06-01';
+          bodyPayload = {
+            model: model || providerDefaults.anthropic.defaultModel,
+            max_tokens: 150,
+            messages: [{ role: 'user', content: prompt }]
           };
-          body = JSON.stringify({
-            contents: [{
-              parts: [{
-                text: prompt
-              }]
-            }]
-          });
           break;
-          
-        default:
-          // Default to OpenAI format
-          apiUrl = 'https://api.openai.com/v1/chat/completions';
-          headers = {
-            'Authorization': `Bearer ${this.apiKey}`,
-            'Content-Type': 'application/json'
+        }
+        case 'gemini': {
+          const endpointBase = baseUrl || providerDefaults.gemini.baseUrl;
+          apiUrl = `${endpointBase}/models/${encodeURIComponent(model || providerDefaults.gemini.defaultModel)}:generateContent`;
+          headers['x-goog-api-key'] = apiKey;
+          bodyPayload = {
+            contents: [
+              {
+                role: 'user',
+                parts: [{ text: prompt }]
+              }
+            ]
           };
-          body = JSON.stringify({
-            model: 'gpt-3.5-turbo',
+          break;
+        }
+        case 'zai': {
+          const endpointBase = baseUrl || providerDefaults.zai.baseUrl;
+          apiUrl = `${endpointBase}/chat/completions`;
+          headers['Authorization'] = `Bearer ${apiKey}`;
+          bodyPayload = {
+            model: model || providerDefaults.zai.defaultModel,
             messages: [{ role: 'user', content: prompt }],
             max_tokens: 150,
-            temperature: 0.3
-          });
+            temperature
+          };
+          break;
+        }
+        case 'custom': {
+          const endpointBase = baseUrl || providerDefaults.custom.baseUrl;
+          if (!endpointBase) {
+            throw new Error('Custom provider selected but no base URL configured.');
+          }
+          apiUrl = `${endpointBase}/chat/completions`;
+          headers['Authorization'] = `Bearer ${apiKey}`;
+          bodyPayload = {
+            model: model || providerDefaults.custom.defaultModel || 'gpt-3.5-turbo',
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 150,
+            temperature
+          };
+          break;
+        }
+        default: {
+          throw new Error(`Unsupported provider: ${provider}`);
+        }
       }
-      
+
+      apiUrl = apiUrl.replace(/([^:]\/)\/+/g, '$1');
+
       const response = await fetch(apiUrl, {
         method: 'POST',
-        headers: headers,
-        body: body
+        headers,
+        body: JSON.stringify(bodyPayload)
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`LLM API request failed with status ${response.status}: ${errorText}`);
+        const errorText = await response.text().catch(() => '');
+        throw new Error(`LLM ${provider} request failed with status ${response.status}: ${errorText.slice(0, 300)}`);
       }
 
       const data = await response.json();
-      
-      let content;
-      switch(this.llmProvider) {
-        case 'openai':
-          content = data.choices[0].message.content;
-          break;
-          
-        case 'anthropic':
-          content = data.content[0].text;
-          break;
-          
-        case 'gemini':
-          content = data.candidates[0].content.parts[0].text;
-          break;
-          
-        default:
-          content = data.choices[0].message.content;
+      const content = this.normalizeProviderResponse(provider, data);
+
+      if (!content) {
+        console.debug('[AITabGrouper] Unable to extract response content from provider', { provider, data });
+        return null;
       }
-      
+
       return content;
     } catch (error) {
       console.error('Error calling LLM API:', error);
@@ -592,7 +833,7 @@ If you cannot make a good grouping decision, respond with:
   }
 
   // Fallback static grouping rules
-  async classifyTab(tab, allTabs, existingGroups) {
+  async classifyTab(tab, allTabs = [], existingGroups = []) {
     try {
       const hostname = new URL(tab.url).hostname.toLowerCase();
       const pathname = new URL(tab.url).pathname.toLowerCase();
@@ -699,5 +940,26 @@ If you cannot make a good grouping decision, respond with:
   }
 }
 
+async function initializeTabGrouper() {
+  tabGrouper = new AITabGrouper();
+
+  try {
+    const settings = await chrome.storage.sync.get(['apiKey', 'llmProvider']);
+    if (settings.llmProvider) {
+      tabGrouper.llmProvider = settings.llmProvider;
+    }
+    tabGrouper.apiKey = settings.apiKey || null;
+
+    const initialKey = tabGrouper.resolveApiKey(tabGrouper.llmProvider);
+    tabGrouper.useMock = !initialKey;
+
+    await tabGrouper.loadSettings();
+  } catch (error) {
+    console.error('Failed to load initial settings:', error);
+  }
+}
+
 // Initialize the AI Tab Grouper
-initializeTabGrouper();
+initializeTabGrouper().catch((error) => {
+  console.error('Error initializing AI Tab Grouper:', error);
+});

@@ -1,61 +1,100 @@
 // options.js
-document.addEventListener('DOMContentLoaded', function() {
+document.addEventListener('DOMContentLoaded', () => {
   const apiKeyInput = document.getElementById('apiKey');
   const llmProviderSelect = document.getElementById('llmProvider');
   const saveBtn = document.getElementById('saveBtn');
   const statusDiv = document.getElementById('status');
-  
-  // Load saved settings
-  chrome.storage.sync.get(['apiKey', 'llmProvider'], function(result) {
+
+  const providerLabels = {
+    openai: 'OpenAI',
+    anthropic: 'Anthropic',
+    gemini: 'Google Gemini',
+    zai: 'Z.ai (GLM)',
+    custom: 'Custom API'
+  };
+
+  const providerRequiresKey = (provider) => ['openai', 'anthropic', 'custom'].includes(provider);
+  const providerSupportsEnvFallback = (provider) => ['gemini', 'zai'].includes(provider);
+
+  const probeEnvKey = (provider) => new Promise((resolve) => {
+    try {
+      chrome.runtime.sendMessage({ action: 'probeEnvKey', provider }, (response) => {
+        if (chrome.runtime.lastError) {
+          resolve(false);
+          return;
+        }
+        resolve(Boolean(response && response.present));
+      });
+    } catch (error) {
+      console.error('Error probing environment key:', error);
+      resolve(false);
+    }
+  });
+
+  const showStatus = (message, type) => {
+    statusDiv.textContent = message;
+    statusDiv.className = `status ${type}`;
+    statusDiv.style.display = 'block';
+
+    setTimeout(() => {
+      statusDiv.style.display = 'none';
+    }, 3000);
+  };
+
+  chrome.storage.sync.get(['apiKey', 'llmProvider'], (result) => {
     if (result.apiKey) {
       apiKeyInput.value = result.apiKey;
     }
     if (result.llmProvider) {
       llmProviderSelect.value = result.llmProvider;
     } else {
-      llmProviderSelect.value = 'openai'; // default
+      llmProviderSelect.value = 'openai';
     }
   });
-  
-  // Save settings when button is clicked
-  saveBtn.addEventListener('click', function() {
+
+  saveBtn.addEventListener('click', async () => {
     const apiKey = apiKeyInput.value.trim();
-    const llmProvider = llmProviderSelect.value;
-    
-    // Basic validation
-    if (!apiKey) {
-      showStatus('Please enter an API key', 'error');
+    const provider = llmProviderSelect.value;
+    const providerLabel = providerLabels[provider] || provider;
+
+    if (providerRequiresKey(provider) && !apiKey) {
+      showStatus(`API key is required for ${providerLabel}.`, 'error');
       return;
     }
-    
-    // Save to chrome.storage
+
+    let statusType = 'success';
+    let statusMessage = 'Settings saved successfully!';
+
+    if (!apiKey && providerSupportsEnvFallback(provider)) {
+      const hasEnvKey = await probeEnvKey(provider);
+      if (hasEnvKey) {
+        statusType = 'warn';
+        statusMessage = `${providerLabel}: using environment API key.`;
+      } else {
+        statusType = 'warn';
+        statusMessage = `${providerLabel}: no API key detected; grouping calls will be skipped until one is provided.`;
+      }
+    }
+
     chrome.storage.sync.set({
       apiKey: apiKey,
-      llmProvider: llmProvider
-    }, function() {
+      llmProvider: provider
+    }, () => {
       if (chrome.runtime.lastError) {
-        showStatus('Error saving settings: ' + chrome.runtime.lastError.message, 'error');
-      } else {
-        showStatus('Settings saved successfully!', 'success');
-        
-        // Update the background script with the new API key
-        chrome.runtime.sendMessage({
-          action: 'updateApiKey',
-          apiKey: apiKey,
-          llmProvider: llmProvider
-        });
+        showStatus(`Error saving settings: ${chrome.runtime.lastError.message}`, 'error');
+        return;
       }
+
+      showStatus(statusMessage, statusType);
+
+      chrome.runtime.sendMessage({
+        action: 'updateApiKey',
+        apiKey: apiKey,
+        llmProvider: provider
+      }, () => {
+        // Intentionally ignore errors here; background SW may be sleeping.
+        void chrome.runtime.lastError;
+      });
     });
   });
-  
-  function showStatus(message, type) {
-    statusDiv.textContent = message;
-    statusDiv.className = 'status ' + type;
-    statusDiv.style.display = 'block';
-    
-    // Hide after 3 seconds
-    setTimeout(function() {
-      statusDiv.style.display = 'none';
-    }, 3000);
-  }
 });

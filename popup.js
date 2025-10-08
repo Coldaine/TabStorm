@@ -21,8 +21,12 @@ document.addEventListener('DOMContentLoaded', async () => {
       tabCountElement.textContent = tabs.length;
       
       // Get current window groups
-      const groups = await chrome.tabGroups.query({windowId: tabs[0]?.windowId});
-      groupCountElement.textContent = groups.length;
+      let groupCount = 0;
+      if (tabs.length > 0) {
+        const groups = await chrome.tabGroups.query({windowId: tabs[0].windowId});
+        groupCount = groups.length;
+      }
+      groupCountElement.textContent = groupCount;
       
       // Update status text
       extensionStatusElement.textContent = isGroupingEnabled ? 'Active' : 'Paused';
@@ -35,7 +39,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Load saved settings
   async function loadSettings() {
     try {
-      const settings = await chrome.storage.sync.get(['groupingMode', 'llmProvider']);
+      const settings = await chrome.storage.sync.get(['groupingMode', 'llmProvider', 'groupingPaused']);
       
       if (settings.groupingMode) {
         groupingModeSelect.value = settings.groupingMode;
@@ -47,6 +51,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         llmProviderSelect.value = settings.llmProvider;
       } else {
         llmProviderSelect.value = 'openai'; // default
+      }
+
+      if (typeof settings.groupingPaused === 'boolean') {
+        isGroupingEnabled = !settings.groupingPaused;
+        extensionStatusElement.textContent = isGroupingEnabled ? 'Active' : 'Paused';
+        toggleGroupingBtn.textContent = isGroupingEnabled ? 'Pause Grouping' : 'Resume Grouping';
       }
     } catch (error) {
       console.error('Error loading settings:', error);
@@ -141,5 +151,4 @@ document.addEventListener('DOMContentLoaded', async () => {
       alert('Error creating test tabs. See console for details.');
     }
   });
-});
 });

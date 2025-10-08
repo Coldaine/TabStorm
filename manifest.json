@@ -1,8 +1,8 @@
 {
-  "name": "AI Tab Grouper",
+  "name": "TabStorm",
   "version": "1.0",
   "manifest_version": 3,
-  "description": "An AI-powered Chrome extension that automatically groups tabs based on content",
+  "description": "A browser extension for grouping tabs with a storm theme",
   "background": {
     "service_worker": "background.js"
   },
@@ -16,14 +16,15 @@
   "permissions": [
     "tabs",
     "tabGroups",
-    "storage"
+    "storage",
+    "scripting"
   ],
   "host_permissions": [
     "<all_urls>"
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "AI Tab Grouper"
+    "default_title": "TabStorm"
   },
   "options_page": "options.html",
   "icons": {

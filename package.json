@@ -1,12 +1,17 @@
 {
-  "name": "chromegrouper",
+  "name": "tabstorm",
   "version": "1.0.0",
-  "description": "",
+  "description": "A browser extension for grouping tabs with a storm theme",
   "main": "background.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
+  "keywords": [
+    "tabs",
+    "groups",
+    "browser",
+    "extension"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
