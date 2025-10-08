@@ -9,6 +9,8 @@ async function initializeTabGrouper() {
   if (settings.apiKey) {
     tabGrouper.apiKey = settings.apiKey;
     tabGrouper.useMock = false;
+  } else {
+    tabGrouper.useMock = true; // Use mock if no API key is provided
   }
   if (settings.llmProvider) {
     tabGrouper.llmProvider = settings.llmProvider;
@@ -144,7 +146,10 @@ class AITabGrouper {
     try {
       // Call OpenAI, Claude, or other API
       const response = await this.callExternalLLM(prompt);
-      return this.parseLLMResponse(response);
+      const parsedResponse = this.parseLLMResponse(response);
+      
+      // Validate and enhance the response
+      return this.validateGroupingResponse(parsedResponse, existingGroups);
     } catch (error) {
       console.error('Error calling external LLM:', error);
       // Return a default response to avoid breaking functionality
@@ -154,52 +159,119 @@ class AITabGrouper {
       };
     }
   }
+  
+  // Validate and enhance grouping response
+  validateGroupingResponse(response, existingGroups) {
+    // Ensure required fields exist
+    if (typeof response.shouldGroup !== 'boolean') {
+      response.shouldGroup = false;
+    }
+    
+    if (!response.reasoning) {
+      response.reasoning = "No reasoning provided by LLM";
+    }
+    
+    // If shouldGroup is true, ensure groupName and color are provided
+    if (response.shouldGroup) {
+      if (!response.groupName) {
+        response.groupName = "Uncategorized";
+      }
+      
+      // Validate color against allowed values
+      const validColors = ["red", "blue", "green", "yellow", "purple", "pink", "cyan", "orange"];
+      if (!validColors.includes(response.color)) {
+        response.color = "grey"; // Default to grey if invalid color is provided
+      }
+      
+      // If existingGroupId is provided, verify it exists in the current groups
+      if (response.existingGroupId) {
+        const groupExists = existingGroups.some(g => g.id === response.existingGroupId);
+        if (!groupExists) {
+          console.warn(`LLM suggested non-existent group ID: ${response.existingGroupId}. Creating new group instead.`);
+          response.existingGroupId = null;
+        }
+      }
+    }
+    
+    return response;
+  }
 
   // Build the prompt to send to the LLM
   buildGroupingPrompt(tab, allTabs, existingGroups) {
     const tabInfo = {
       url: tab.url,
       title: tab.title,
-      domain: new URL(tab.url).hostname
+      domain: new URL(tab.url).hostname,
+      // Extract additional context from the URL
+      pathname: new URL(tab.url).pathname,
+      search: new URL(tab.url).search
     };
 
-    const existingTabInfo = allTabs.map(t => ({
-      title: t.title,
-      domain: new URL(t.url).hostname,
-      groupId: t.groupId
-    }));
+    const existingTabInfo = allTabs
+      .filter(t => t.id !== tab.id) // Exclude the current tab from existing tabs
+      .map(t => ({
+        title: t.title,
+        domain: new URL(t.url).hostname,
+        groupId: t.groupId
+      }));
 
     const existingGroupInfo = existingGroups.map(g => ({
+      id: g.id,
       title: g.title,
       color: g.color
     }));
 
     return `
-Analyze this tab and decide how to group it:
+You are an intelligent tab grouping assistant. Analyze the new tab and determine the best way to organize it with other tabs.
 
-NEW TAB:
+NEW TAB TO ANALYZE:
+- Title: "${tabInfo.title}"
 - URL: ${tabInfo.url}
-- Title: ${tabInfo.title}
 - Domain: ${tabInfo.domain}
+- Path: ${tabInfo.pathname}
 
-EXISTING TABS IN WINDOW:
-${existingTabInfo.map(t => `- ${t.title} (${t.domain})`).join('\n')}
+EXISTING TABS IN THE SAME WINDOW:
+${existingTabInfo.length > 0 
+  ? existingTabInfo.map(t => `- "${t.title}" (${t.domain})`).join('\n') 
+  : 'No other tabs in this window'}
 
-EXISTING GROUPS IN WINDOW:
-${existingGroupInfo.map(g => `- "${g.title}" (${g.color})`).join('\n')}
+EXISTING GROUPS IN THE SAME WINDOW:
+${existingGroupInfo.length > 0 
+  ? existingGroupInfo.map(g => `- Group ID: ${g.id}, Title: "${g.title}", Color: ${g.color}`).join('\n')
+  : 'No existing groups in this window'}
 
-TASK: Should this tab be grouped? If yes, provide:
-1. Group name (creative, descriptive)
-2. Color (red, orange, yellow, green, blue, purple, pink, cyan)  
-3. Whether to use existing group or create new one
+TASK:
+Analyze the content, domain, and purpose of the new tab. Decide if it should be grouped with existing tabs or if it needs its own group.
 
-Respond in JSON format:
+If there's an existing group with similar content, suggest using that group (provide the exact group ID).
+If the tab is unique or doesn't fit existing groups, suggest creating a new group.
+
+When creating new groups, use creative, descriptive, and specific names that accurately represent the content/website purpose. Avoid generic names like "General" or "Other".
+
+Group name suggestions: Shopping, Social Media, News & Updates, Entertainment, Work & Productivity, Learning & Education, Finance & Banking, Health & Fitness, Travel & Maps, etc.
+
+COLOR SELECTION GUIDELINES:
+- Red: Social Media, Entertainment
+- Blue: Work, Communication, Productivity
+- Green: Nature, Health, Finance, Environment
+- Yellow: News, Alerts, Notifications
+- Purple: Creative, Art, Design, Lifestyle
+- Orange: Shopping, Deals, Food
+- Pink: Fashion, Beauty, Lifestyle
+- Cyan: Technology, Science, Information
+
+IMPORTANT: Respond with only valid JSON in the following exact format:
 {
-  "shouldGroup": true/false,
-  "groupName": "Creative Group Name",
+  "shouldGroup": true,
+  "groupName": "Specific and descriptive group name",
   "color": "blue",
-  "existingGroupId": null or actual existing group id from the list,
-  "reasoning": "Brief explanation"
+  "existingGroupId": null (to create new) or existing group ID (like 123) to add to existing group,
+  "reasoning": "Brief explanation of why this tab should be grouped this way"
+}
+If you cannot make a good grouping decision, respond with:
+{
+  "shouldGroup": false,
+  "reasoning": "Brief explanation of why grouping is not appropriate"
 }
 `;
   }
