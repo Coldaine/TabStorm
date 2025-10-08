@@ -115,8 +115,39 @@ class AITabGrouper {
     console.log(`Found ${groupsInWindow.length} existing groups in window ${tab.windowId}`);
     
     try {
-      // Call the LLM for grouping decision (could use static rules or LLM based on config)
-      const groupDecision = await this.callLLMForGrouping(tab, tabsInWindow, groupsInWindow);
+      // Extract content from the current tab
+      let tabContent = null;
+      try {
+        // Execute content script to extract page content
+        tabContent = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: () => {
+            // This function will run in the content script context
+            return {
+              title: document.title,
+              description: document.querySelector('meta[name="description"]')?.content || '',
+              headings: Array.from(document.querySelectorAll('h1, h2, h3')).map(el => el.textContent.trim()),
+              url: window.location.href,
+              hostname: window.location.hostname
+            };
+          }
+        });
+        
+        // Get the result from the content script execution
+        if (tabContent && tabContent[0] && tabContent[0].result) {
+          tabContent = tabContent[0].result;
+        } else {
+          console.log(`Could not extract content from tab ${tab.id}, using basic info only`);
+          tabContent = null;
+        }
+      } catch (contentError) {
+        console.log(`Content script execution failed for tab ${tab.id}:`, contentError.message);
+        // Continue with basic info if content script fails
+        tabContent = null;
+      }
+      
+      // Call the LLM for grouping decision with content if available
+      const groupDecision = await this.callLLMForGrouping(tab, tabsInWindow, groupsInWindow, tabContent);
       
       if (groupDecision.shouldGroup) {
         await this.executeGrouping(tab, groupDecision);
@@ -134,14 +165,14 @@ class AITabGrouper {
   }
 
   // New method: Call LLM API for grouping decision
-  async callLLMForGrouping(tab, allTabs, existingGroups) {
+  async callLLMForGrouping(tab, allTabs, existingGroups, tabContent = null) {
     if (this.useMock) {
       // Use mock response for testing
       return this.getMockGroupingResponse(tab, allTabs, existingGroups);
     }
     
-    // Build prompt for the LLM
-    const prompt = this.buildGroupingPrompt(tab, allTabs, existingGroups);
+    // Build prompt for the LLM with content information
+    const prompt = this.buildGroupingPrompt(tab, allTabs, existingGroups, tabContent);
     
     try {
       // Call OpenAI, Claude, or other API
@@ -197,7 +228,7 @@ class AITabGrouper {
   }
 
   // Build the prompt to send to the LLM
-  buildGroupingPrompt(tab, allTabs, existingGroups) {
+  buildGroupingPrompt(tab, allTabs, existingGroups, tabContent = null) {
     const tabInfo = {
       url: tab.url,
       title: tab.title,
@@ -221,6 +252,16 @@ class AITabGrouper {
       color: g.color
     }));
 
+    let contentDescription = "No additional content available";
+    if (tabContent) {
+      contentDescription = `
+Page Title: "${tabContent.title}"
+Meta Description: "${tabContent.description}"
+Headings: [${tabContent.headings && tabContent.headings.length > 0 ? tabContent.headings.slice(0, 5).join(', ') : 'No headings found'}]
+Hostname: ${tabContent.hostname}
+`;
+    }
+
     return `
 You are an intelligent tab grouping assistant. Analyze the new tab and determine the best way to organize it with other tabs.
 
@@ -229,6 +270,9 @@ NEW TAB TO ANALYZE:
 - URL: ${tabInfo.url}
 - Domain: ${tabInfo.domain}
 - Path: ${tabInfo.pathname}
+
+PAGE CONTENT ANALYSIS:
+${contentDescription}
 
 EXISTING TABS IN THE SAME WINDOW:
 ${existingTabInfo.length > 0 
@@ -242,6 +286,8 @@ ${existingGroupInfo.length > 0
 
 TASK:
 Analyze the content, domain, and purpose of the new tab. Decide if it should be grouped with existing tabs or if it needs its own group.
+
+Consider the page content analysis when making your decision, as it provides more context than just the URL.
 
 If there's an existing group with similar content, suggest using that group (provide the exact group ID).
 If the tab is unique or doesn't fit existing groups, suggest creating a new group.
