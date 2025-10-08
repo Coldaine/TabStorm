@@ -78,6 +78,12 @@ class AITabGrouper {
     this.llmProvider = 'openai'; // Default provider
     this.useMock = true; // Default to using mock responses during development
     this.groupingMode = 'auto'; // Default to automatic AI-powered grouping
+    
+    // Rate limiting properties
+    this.apiCallHistory = []; // Track API calls with timestamps
+    this.maxCallsPerMinute = 20; // Limit to 20 calls per minute
+    this.minDelayBetweenCalls = 1000; // Minimum 1 second between calls
+    
     this.setupEventListeners();
     
     // Load initial settings
@@ -127,34 +133,34 @@ class AITabGrouper {
   }
 
   async analyzeAndGroupTab(tab) {
-    console.log(`Analyzing tab: ${tab.title} (${tab.url})`);
-    
-    // Check grouping mode and paused state
-    const settings = await chrome.storage.sync.get(['groupingMode', 'groupingPaused']);
-    const groupingMode = settings.groupingMode || 'auto';
-    const groupingPaused = settings.groupingPaused || false;
-    
-    // Skip grouping if paused or disabled
-    if (groupingPaused || groupingMode === 'disabled') {
-      console.log(`Grouping is ${groupingPaused ? 'paused' : 'disabled'}, skipping tab ${tab.id}`);
-      return;
-    }
-    
-    // Skip if tab is already in a group
-    if (tab.groupId && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
-      console.log(`Tab ${tab.id} is already in a group (ID: ${tab.groupId}), skipping.`);
-      return;
-    }
-    
-    // Get all tabs in the same window
-    const tabsInWindow = await chrome.tabs.query({ windowId: tab.windowId });
-    console.log(`Found ${tabsInWindow.length} tabs in window ${tab.windowId}`);
-    
-    // Get existing groups in the same window
-    const groupsInWindow = await chrome.tabGroups.query({ windowId: tab.windowId });
-    console.log(`Found ${groupsInWindow.length} existing groups in window ${tab.windowId}`);
-    
     try {
+      console.log(`Analyzing tab: ${tab.title} (${tab.url})`);
+      
+      // Check grouping mode and paused state
+      const settings = await chrome.storage.sync.get(['groupingMode', 'groupingPaused']);
+      const groupingMode = settings.groupingMode || 'auto';
+      const groupingPaused = settings.groupingPaused || false;
+      
+      // Skip grouping if paused or disabled
+      if (groupingPaused || groupingMode === 'disabled') {
+        console.log(`Grouping is ${groupingPaused ? 'paused' : 'disabled'}, skipping tab ${tab.id}`);
+        return;
+      }
+      
+      // Skip if tab is already in a group
+      if (tab.groupId && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
+        console.log(`Tab ${tab.id} is already in a group (ID: ${tab.groupId}), skipping.`);
+        return;
+      }
+      
+      // Get all tabs in the same window
+      const tabsInWindow = await chrome.tabs.query({ windowId: tab.windowId });
+      console.log(`Found ${tabsInWindow.length} tabs in window ${tab.windowId}`);
+      
+      // Get existing groups in the same window
+      const groupsInWindow = await chrome.tabGroups.query({ windowId: tab.windowId });
+      console.log(`Found ${groupsInWindow.length} existing groups in window ${tab.windowId}`);
+      
       // For 'manual' mode, we might want to notify user instead of auto-grouping
       if (groupingMode === 'manual') {
         console.log(`Manual mode: Tab ${tab.id} could be grouped, but waiting for user action`);
@@ -166,7 +172,7 @@ class AITabGrouper {
       let tabContent = null;
       try {
         // Execute content script to extract page content
-        tabContent = await chrome.scripting.executeScript({
+        const contentResults = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: () => {
             // This function will run in the content script context
@@ -181,8 +187,8 @@ class AITabGrouper {
         });
         
         // Get the result from the content script execution
-        if (tabContent && tabContent[0] && tabContent[0].result) {
-          tabContent = tabContent[0].result;
+        if (contentResults && contentResults[0] && contentResults[0].result) {
+          tabContent = contentResults[0].result;
         } else {
           console.log(`Could not extract content from tab ${tab.id}, using basic info only`);
           tabContent = null;
@@ -202,11 +208,18 @@ class AITabGrouper {
         console.log(`Tab ${tab.id} should not be grouped according to LLM decision.`);
       }
     } catch (error) {
-      console.error('Error during LLM grouping decision:', error);
-      // Fallback to static rules if LLM fails
-      const fallbackDecision = await this.classifyTab(tab, tabsInWindow, groupsInWindow);
-      if (fallbackDecision.shouldGroup) {
-        await this.executeGrouping(tab, fallbackDecision);
+      console.error('Error during tab analysis and grouping:', error);
+      
+      // Fallback to static rules if primary method fails
+      try {
+        const fallbackDecision = await this.classifyTab(tab, tabsInWindow, groupsInWindow);
+        if (fallbackDecision.shouldGroup) {
+          await this.executeGrouping(tab, fallbackDecision);
+        }
+      } catch (fallbackError) {
+        console.error('Error during fallback classification:', fallbackError);
+        // As a last resort, we can simply log the error and continue
+        console.log(`Tab ${tab.id} will remain ungrouped due to errors:`, error.message);
       }
     }
   }
@@ -369,33 +382,148 @@ If you cannot make a good grouping decision, respond with:
 `;
   }
 
-  // Call external LLM API
+  // Call external LLM API with rate limiting
   async callExternalLLM(prompt) {
     if (!this.apiKey && !this.useMock) {
       throw new Error('No API key configured for LLM');
     }
 
-    // Example for OpenAI API - would need to be customized based on the selected LLM service
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${this.apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'gpt-3.5-turbo', // or gpt-4 if preferred
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 150,
-        temperature: 0.3
-      })
-    });
-
-    if (!response.ok) {
-      throw new Error(`LLM API request failed with status ${response.status}`);
+    // Check rate limiting
+    const now = Date.now();
+    const oneMinuteAgo = now - 60000; // 60 seconds ago
+    
+    // Clean up old entries
+    this.apiCallHistory = this.apiCallHistory.filter(timestamp => timestamp > oneMinuteAgo);
+    
+    // Check if we've exceeded the rate limit
+    if (this.apiCallHistory.length >= this.maxCallsPerMinute) {
+      const oldestCall = this.apiCallHistory[0];
+      const timeUntilReset = 60000 - (now - oldestCall);
+      
+      console.warn(`Rate limit exceeded. Waiting ${Math.ceil(timeUntilReset / 1000)} seconds before next call.`);
+      
+      // Wait until rate limit resets
+      await new Promise(resolve => setTimeout(resolve, timeUntilReset + 1000));
+      
+      // Re-check after waiting
+      const nowAfterWait = Date.now();
+      this.apiCallHistory = this.apiCallHistory.filter(timestamp => timestamp > (nowAfterWait - 60000));
     }
+    
+    // Check minimum delay between calls
+    if (this.apiCallHistory.length > 0) {
+      const lastCallTime = this.apiCallHistory[this.apiCallHistory.length - 1];
+      const timeSinceLastCall = now - lastCallTime;
+      
+      if (timeSinceLastCall < this.minDelayBetweenCalls) {
+        const delay = this.minDelayBetweenCalls - timeSinceLastCall;
+        console.log(`Waiting ${delay}ms to respect minimum delay between API calls`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+    
+    // Record this API call
+    this.apiCallHistory.push(Date.now());
 
-    const data = await response.json();
-    return data.choices[0].message.content;
+    try {
+      // Example for OpenAI API - would need to be customized based on the selected LLM service
+      let apiUrl, headers, body;
+      
+      switch(this.llmProvider) {
+        case 'openai':
+          apiUrl = 'https://api.openai.com/v1/chat/completions';
+          headers = {
+            'Authorization': `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json'
+          };
+          body = JSON.stringify({
+            model: 'gpt-3.5-turbo', // or gpt-4 if preferred
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 150,
+            temperature: 0.3
+          });
+          break;
+          
+        case 'anthropic':
+          apiUrl = 'https://api.anthropic.com/v1/messages';
+          headers = {
+            'x-api-key': this.apiKey,
+            'Content-Type': 'application/json',
+            'anthropic-version': '2023-06-01'
+          };
+          body = JSON.stringify({
+            model: 'claude-3-haiku-20240307',
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 150
+          });
+          break;
+          
+        case 'gemini':
+          apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=${this.apiKey}`;
+          headers = {
+            'Content-Type': 'application/json'
+          };
+          body = JSON.stringify({
+            contents: [{
+              parts: [{
+                text: prompt
+              }]
+            }]
+          });
+          break;
+          
+        default:
+          // Default to OpenAI format
+          apiUrl = 'https://api.openai.com/v1/chat/completions';
+          headers = {
+            'Authorization': `Bearer ${this.apiKey}`,
+            'Content-Type': 'application/json'
+          };
+          body = JSON.stringify({
+            model: 'gpt-3.5-turbo',
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 150,
+            temperature: 0.3
+          });
+      }
+      
+      const response = await fetch(apiUrl, {
+        method: 'POST',
+        headers: headers,
+        body: body
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`LLM API request failed with status ${response.status}: ${errorText}`);
+      }
+
+      const data = await response.json();
+      
+      let content;
+      switch(this.llmProvider) {
+        case 'openai':
+          content = data.choices[0].message.content;
+          break;
+          
+        case 'anthropic':
+          content = data.content[0].text;
+          break;
+          
+        case 'gemini':
+          content = data.candidates[0].content.parts[0].text;
+          break;
+          
+        default:
+          content = data.choices[0].message.content;
+      }
+      
+      return content;
+    } catch (error) {
+      console.error('Error calling LLM API:', error);
+      this.apiCallHistory.pop(); // Remove the failed call from history
+      throw error;
+    }
   }
 
   // Parse the LLM response

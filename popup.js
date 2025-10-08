@@ -113,6 +113,18 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Test button event - opens sample tabs to test grouping
   testBtn.addEventListener('click', async () => {
     try {
+      // Check if API key is configured
+      const settings = await chrome.storage.sync.get(['apiKey']);
+      if (!settings.apiKey) {
+        if (confirm('No API key configured. Test with mock responses?')) {
+          // Temporarily enable mock mode for testing
+          await chrome.storage.sync.set({useMock: true});
+        } else {
+          alert('Please configure your API key in the options page first.');
+          return;
+        }
+      }
+      
       // Open some test tabs that should trigger grouping
       await chrome.tabs.create({url: 'https://www.facebook.com'});
       await chrome.tabs.create({url: 'https://www.gmail.com'});
@@ -129,4 +141,5 @@ document.addEventListener('DOMContentLoaded', async () => {
       alert('Error creating test tabs. See console for details.');
     }
   });
+});
 });
