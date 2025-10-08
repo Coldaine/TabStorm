@@ -17,7 +17,7 @@ async function initializeTabGrouper() {
   }
 }
 
-// Handle messages from options page
+// Handle messages from popup and options page
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'updateApiKey') {
     tabGrouper.apiKey = message.apiKey;
@@ -26,6 +26,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     console.log('API key updated from options page');
     sendResponse({status: 'API key updated'});
     return true; // Indicates we wish to send a response asynchronously
+  } else if (message.action === 'updateGroupingMode') {
+    tabGrouper.groupingMode = message.mode;
+    console.log('Grouping mode updated to:', message.mode);
+    sendResponse({status: 'Grouping mode updated'});
+    return true;
+  } else if (message.action === 'updateLlmProvider') {
+    tabGrouper.llmProvider = message.provider;
+    console.log('LLM provider updated to:', message.provider);
+    sendResponse({status: 'LLM provider updated'});
+    return true;
   }
   return false;
 });
@@ -67,7 +77,26 @@ class AITabGrouper {
     this.apiKey = null; // Will be set via options or default to mock
     this.llmProvider = 'openai'; // Default provider
     this.useMock = true; // Default to using mock responses during development
+    this.groupingMode = 'auto'; // Default to automatic AI-powered grouping
     this.setupEventListeners();
+    
+    // Load initial settings
+    this.loadSettings();
+  }
+  
+  async loadSettings() {
+    try {
+      const settings = await chrome.storage.sync.get(['groupingMode', 'groupingPaused']);
+      if (settings.groupingMode) {
+        this.groupingMode = settings.groupingMode;
+      }
+      if (settings.groupingPaused !== undefined) {
+        // If grouping is paused, we could store this state, 
+        // but for now we'll just check during tab analysis
+      }
+    } catch (error) {
+      console.error('Error loading settings in background:', error);
+    }
   }
 
   setupEventListeners() {
@@ -100,6 +129,17 @@ class AITabGrouper {
   async analyzeAndGroupTab(tab) {
     console.log(`Analyzing tab: ${tab.title} (${tab.url})`);
     
+    // Check grouping mode and paused state
+    const settings = await chrome.storage.sync.get(['groupingMode', 'groupingPaused']);
+    const groupingMode = settings.groupingMode || 'auto';
+    const groupingPaused = settings.groupingPaused || false;
+    
+    // Skip grouping if paused or disabled
+    if (groupingPaused || groupingMode === 'disabled') {
+      console.log(`Grouping is ${groupingPaused ? 'paused' : 'disabled'}, skipping tab ${tab.id}`);
+      return;
+    }
+    
     // Skip if tab is already in a group
     if (tab.groupId && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
       console.log(`Tab ${tab.id} is already in a group (ID: ${tab.groupId}), skipping.`);
@@ -115,6 +155,13 @@ class AITabGrouper {
     console.log(`Found ${groupsInWindow.length} existing groups in window ${tab.windowId}`);
     
     try {
+      // For 'manual' mode, we might want to notify user instead of auto-grouping
+      if (groupingMode === 'manual') {
+        console.log(`Manual mode: Tab ${tab.id} could be grouped, but waiting for user action`);
+        // Could send a notification to user here
+        return;
+      }
+      
       // Extract content from the current tab
       let tabContent = null;
       try {

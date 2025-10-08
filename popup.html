@@ -30,22 +30,76 @@
       border-radius: 4px;
       cursor: pointer;
       margin-top: 10px;
+      width: 100%;
+      margin-bottom: 5px;
     }
     button:hover {
       background-color: #3367d6;
+    }
+    .control-group {
+      margin-top: 15px;
+      padding: 10px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+    }
+    .control-group h3 {
+      margin-top: 0;
+      margin-bottom: 10px;
+      font-size: 14px;
+    }
+    select, input {
+      width: 100%;
+      padding: 5px;
+      margin-bottom: 5px;
+      box-sizing: border-box;
+    }
+    .settings-link {
+      display: block;
+      text-align: center;
+      color: #4285f4;
+      text-decoration: none;
+      margin-top: 10px;
+      font-size: 12px;
+    }
+    .settings-link:hover {
+      text-decoration: underline;
     }
   </style>
 </head>
 <body>
   <h1>AI Tab Grouper</h1>
   <p>Your AI-powered tab grouping assistant is running.</p>
+  
   <div class="status">
-    <p><strong>Status:</strong> Active</p>
+    <p><strong>Status:</strong> <span id="extensionStatus">Active</span></p>
     <p>Current window has <span id="tabCount">0</span> tabs</p>
     <p>and <span id="groupCount">0</span> groups</p>
   </div>
+  
   <button id="refreshBtn">Refresh Stats</button>
   <button id="testBtn">Test Grouping</button>
+  <button id="toggleGroupingBtn">Pause Grouping</button>
+  
+  <div class="control-group">
+    <h3>Grouping Settings</h3>
+    <label for="groupingMode">Grouping Mode:</label>
+    <select id="groupingMode">
+      <option value="auto">Automatic (AI-powered)</option>
+      <option value="manual">Manual only</option>
+      <option value="disabled">Disabled</option>
+    </select>
+    
+    <label for="llmProvider">LLM Provider:</label>
+    <select id="llmProvider">
+      <option value="openai">OpenAI</option>
+      <option value="anthropic">Anthropic (Claude)</option>
+      <option value="gemini">Google Gemini</option>
+      <option value="custom">Custom API</option>
+    </select>
+  </div>
+  
+  <a href="options.html" class="settings-link" target="_blank">More Settings</a>
+  
   <script src="popup.js"></script>
 </body>
 </html>
