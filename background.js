@@ -1023,3 +1023,8 @@ async function initializeTabGrouper() {
 initializeTabGrouper().catch((error) => {
   console.error('Error initializing AI Tab Grouper:', error);
 });
+
+// For testing purposes
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = AITabGrouper;
+}
