@@ -1,6 +1,9 @@
 // background.js
 console.log("AI Tab Grouper background service worker loaded");
 
+// For testing: chrome will be set by the constructor
+let chrome;
+
 // Will be instantiated after the class declaration
 let tabGrouper = null;
 
@@ -43,53 +46,70 @@ const providerDefaults = {
 const envKeyNotified = new Set();
 
 // Handle messages from popup and options page
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message?.action === 'probeEnvKey') {
-    const env = getEnv();
-    let present = false;
-    if (message.provider === 'gemini') {
-      present = Boolean(env.GEMINI_API_KEY || env.GOOGLE_API_KEY);
-    } else if (message.provider === 'zai') {
-      present = Boolean(env.ZAI_API_KEY || env.Z_AI_API_KEY);
+if (typeof chrome !== 'undefined' && chrome.runtime) {
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.action === 'probeEnvKey') {
+      const env = getEnv();
+      let present = false;
+      if (message.provider === 'gemini') {
+        present = Boolean(env.GEMINI_API_KEY || env.GOOGLE_API_KEY);
+      } else if (message.provider === 'zai') {
+        present = Boolean(env.ZAI_API_KEY || env.Z_AI_API_KEY);
+      }
+      sendResponse?.({ ok: true, present });
+      return true;
     }
-    sendResponse?.({ ok: true, present });
-    return true;
-  }
 
-  if (!tabGrouper) {
-    console.warn('Tab grouper not initialized yet; ignoring message:', message.action);
-    sendResponse?.({ status: 'Tab grouper not ready' });
-    return true;
-  }
-
-  if (message.action === 'updateApiKey') {
-    tabGrouper.apiKey = message.apiKey || null;
-    if (message.llmProvider) {
-      tabGrouper.llmProvider = message.llmProvider;
+    if (!tabGrouper) {
+      console.warn('Tab grouper not initialized yet; ignoring message:', message.action);
+      sendResponse?.({ status: 'Tab grouper not ready' });
+      return true;
     }
-    const hasKey = tabGrouper.resolveApiKey(tabGrouper.llmProvider);
-    tabGrouper.useMock = !hasKey;
-    console.log('API key updated from options page');
-    sendResponse({status: 'API key updated'});
-    return true; // Indicates we wish to send a response asynchronously
-  } else if (message.action === 'updateGroupingMode') {
-    tabGrouper.groupingMode = message.mode;
-    console.log('Grouping mode updated to:', message.mode);
-    sendResponse({status: 'Grouping mode updated'});
-    return true;
-  } else if (message.action === 'updateLlmProvider') {
-    tabGrouper.llmProvider = message.provider;
-    const hasKey = tabGrouper.resolveApiKey(tabGrouper.llmProvider);
-    tabGrouper.useMock = !hasKey;
-    console.log('LLM provider updated to:', message.provider);
-    sendResponse({status: 'LLM provider updated'});
-    return true;
-  }
-  return false;
-});
+
+    if (message.action === 'updateApiKey') {
+      tabGrouper.apiKey = message.apiKey || null;
+      if (message.llmProvider) {
+        tabGrouper.llmProvider = message.llmProvider;
+      }
+      const hasKey = tabGrouper.resolveApiKey(tabGrouper.llmProvider);
+      tabGrouper.useMock = !hasKey;
+      console.log('API key updated from options page');
+      sendResponse({status: 'API key updated'});
+      return true; // Indicates we wish to send a response asynchronously
+    } else if (message.action === 'updateGroupingMode') {
+      tabGrouper.groupingMode = message.mode;
+      console.log('Grouping mode updated to:', message.mode);
+      sendResponse({status: 'Grouping mode updated'});
+      return true;
+    } else if (message.action === 'updateLlmProvider') {
+      tabGrouper.llmProvider = message.provider;
+      const hasKey = tabGrouper.resolveApiKey(tabGrouper.llmProvider);
+      tabGrouper.useMock = !hasKey;
+      console.log('LLM provider updated to:', message.provider);
+      sendResponse({status: 'LLM provider updated'});
+      return true;
+    }
+    return false;
+  });
+}
 
 class AITabGrouper {
-  constructor() {
+  constructor(fakeLLMProvider = null, chromeApis = null) {
+    // For testing: make chrome APIs available globally if provided
+    if (chromeApis) {
+      chrome = chromeApis;
+    } else if (typeof globalThis !== 'undefined' && globalThis.chrome) {
+      console.error('Setting chrome from globalThis.chrome');
+      chrome = globalThis.chrome;
+    } else if (typeof global !== 'undefined' && global.chrome) {
+      console.error('Setting chrome from global.chrome');
+      chrome = global.chrome;
+    } else if (typeof window !== 'undefined' && window.chrome) {
+      console.error('Setting chrome from window.chrome');
+      chrome = window.chrome;
+    } else {
+      console.error('No chrome found, leaving undefined');
+    }
     this.groupingRules = [
       { 
         name: "Social Media", 
@@ -145,6 +165,9 @@ class AITabGrouper {
     this.maxCallsPerMinute = 20; // Limit to 20 calls per minute
     this.minDelayBetweenCalls = 1000; // Minimum 1 second between calls
     
+    // For testing: inject fake LLM provider
+    this.fakeLLMProvider = fakeLLMProvider;
+    
     this.setupEventListeners();
     
     // Load initial settings
@@ -152,6 +175,11 @@ class AITabGrouper {
   }
   
   async loadSettings() {
+    // Only load settings if chrome APIs are available
+    if (typeof chrome === 'undefined' || !chrome.storage) {
+      return;
+    }
+
     try {
       const settings = await chrome.storage.sync.get(['groupingMode', 'groupingPaused']);
       if (settings.groupingMode) {
@@ -167,6 +195,11 @@ class AITabGrouper {
   }
 
   setupEventListeners() {
+    // Only set up event listeners if chrome APIs are available (not in test environment)
+    if (typeof chrome === 'undefined' || !chrome.tabs) {
+      return;
+    }
+
     // Monitor new tabs
     chrome.tabs.onCreated.addListener((tab) => {
       console.log('New tab created:', tab.id, tab.url);
@@ -208,7 +241,9 @@ class AITabGrouper {
   }
 
   scheduleTabAnalysis(tab) {
+    console.log(`scheduleTabAnalysis called for tab:`, tab);
     if (!tab || typeof tab.id === 'undefined' || !this.isProcessableTab(tab)) {
+      console.log(`Tab not processable:`, { tab, processable: this.isProcessableTab(tab) });
       return;
     }
 
@@ -237,18 +272,18 @@ class AITabGrouper {
     this.pendingTabs.clear();
     this.batchTimer = null;
 
-    console.log(`Processing batch of ${tabsToProcess.length} tabs.`);
-
     // Filter out any tabs that might have been closed or are no longer processable
     const validTabs = [];
     for (const tab of tabsToProcess) {
       try {
         const latestTabState = await chrome.tabs.get(tab.id);
-        if (this.isProcessableTab(latestTabState) && this.isUngrouped(latestTabState)) {
+        const processable = this.isProcessableTab(latestTabState);
+        const ungrouped = this.isUngrouped(latestTabState);
+        if (processable && ungrouped) {
           validTabs.push(latestTabState);
         }
       } catch (e) {
-        console.debug(`Tab ${tab.id} no longer exists, removing from batch.`);
+        console.error(`Tab ${tab.id} no longer exists, removing from batch:`, e);
       }
     }
 
@@ -305,7 +340,10 @@ class AITabGrouper {
   }
 
   isUngrouped(tab) {
-    return !tab.groupId || tab.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE;
+    const TAB_GROUP_ID_NONE = (typeof chrome !== 'undefined' && chrome.tabGroups) 
+      ? chrome.tabGroups.TAB_GROUP_ID_NONE 
+      : -1;
+    return !tab.groupId || tab.groupId === TAB_GROUP_ID_NONE;
   }
 
   resolveApiKey(provider) {
@@ -518,11 +556,8 @@ class AITabGrouper {
       return this.validateGroupingResponse(parsedResponse, existingGroups);
     } catch (error) {
       console.error('Error calling external LLM:', error);
-      // Return a default response to avoid breaking functionality
-      return {
-        shouldGroup: false,
-        reasoning: `LLM API Error: ${error.message}`
-      };
+      // Re-throw to trigger fallback classification
+      throw error;
     }
   }
   
@@ -639,6 +674,11 @@ If the tabs do not share a common theme or should not be grouped:
 
   // Call external LLM API with rate limiting
   async callExternalLLM(prompt) {
+    // For testing: use fake LLM provider if available
+    if (this.fakeLLMProvider) {
+      return this.fakeLLMProvider.call(prompt);
+    }
+
     if (!prompt) {
       return null;
     }
@@ -1019,10 +1059,12 @@ async function initializeTabGrouper() {
   }
 }
 
-// Initialize the AI Tab Grouper
-initializeTabGrouper().catch((error) => {
-  console.error('Error initializing AI Tab Grouper:', error);
-});
+// Initialize the AI Tab Grouper only if chrome APIs are available
+if (typeof chrome !== 'undefined' && chrome.storage) {
+  initializeTabGrouper().catch((error) => {
+    console.error('Error initializing AI Tab Grouper:', error);
+  });
+}
 
 // For testing purposes
 if (typeof module !== "undefined" && module.exports) {
