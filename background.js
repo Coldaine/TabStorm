@@ -240,6 +240,27 @@ class AITabGrouper {
     });
   }
 
+  // Cleanup method for testing - clears all timers and pending operations
+  cleanup() {
+    // Clear all analysis timers
+    for (const [tabId, timer] of this.analysisTimers) {
+      clearTimeout(timer);
+    }
+    this.analysisTimers.clear();
+
+    // Clear batch timer
+    if (this.batchTimer) {
+      clearTimeout(this.batchTimer);
+      this.batchTimer = null;
+    }
+
+    // Clear pending tabs
+    this.pendingTabs.clear();
+
+    // Clear notification actions
+    this.notificationActions.clear();
+  }
+
   scheduleTabAnalysis(tab) {
     console.log(`scheduleTabAnalysis called for tab:`, tab);
     if (!tab || typeof tab.id === 'undefined' || !this.isProcessableTab(tab)) {
@@ -503,11 +524,30 @@ class AITabGrouper {
       }
     } catch (error) {
       console.error('Error during batch tab analysis and grouping:', error);
-      // Fallback for the first tab in the batch for simplicity
+      // Fallback: classify all tabs in the batch and group matching ones
       try {
-        const fallbackDecision = await this.classifyTab(primaryTab, tabsInWindow, groupsInWindow);
-        if (fallbackDecision.shouldGroup) {
-          await this.executeGrouping([primaryTab], fallbackDecision);
+        const matchingTabs = [];
+        let fallbackGroupDecision = null;
+
+        // Classify each tab in the batch
+        for (const tab of tabs) {
+          const decision = await this.classifyTab(tab, tabsInWindow, groupsInWindow);
+          if (decision.shouldGroup) {
+            // If this is the first matching tab, use its decision
+            if (!fallbackGroupDecision) {
+              fallbackGroupDecision = decision;
+              matchingTabs.push(tab);
+            }
+            // If it matches the same group as the first match, add it
+            else if (decision.groupName === fallbackGroupDecision.groupName && decision.color === fallbackGroupDecision.color) {
+              matchingTabs.push(tab);
+            }
+          }
+        }
+
+        // If we found matching tabs, group them
+        if (fallbackGroupDecision && matchingTabs.length > 0) {
+          await this.executeGrouping(matchingTabs, fallbackGroupDecision);
         }
       } catch (fallbackError) {
         console.error('Error during fallback classification:', fallbackError);

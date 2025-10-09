@@ -113,6 +113,13 @@ class FakeChromeTabs {
     const { tabIds, groupId } = options;
     const newGroupId = groupId || this.tabGroups.nextGroupId++;
 
+    // Validate that all tabs exist (Chrome would throw an error for invalid tab IDs)
+    const validTabIds = tabIds.filter(tabId => this.tabs.has(tabId));
+    if (validTabIds.length !== tabIds.length) {
+      const invalidIds = tabIds.filter(tabId => !this.tabs.has(tabId));
+      throw new Error(`Tabs not found: ${invalidIds.join(', ')}`);
+    }
+
     // Create the group if it doesn't exist
     if (!this.tabGroups.groups.has(newGroupId)) {
       this.tabGroups.groups.set(newGroupId, {
@@ -124,7 +131,7 @@ class FakeChromeTabs {
       });
     }
 
-    tabIds.forEach(tabId => {
+    validTabIds.forEach(tabId => {
       const tab = this.tabs.get(tabId);
       if (tab) {
         tab.groupId = newGroupId;
@@ -585,10 +592,21 @@ class TabStormTestEnvironment {
     this.tabGroups.nextGroupId = 1;
     this.storage.storage.clear();
     this.notifications.notifications.clear();
+    this.notifications.listeners.onClicked.length = 0; // Clear notification listeners
     this.scripting.scripts.clear();
     this.llmProvider.callHistory.length = 0;
     this.llmProvider.responses.length = 0;
     this.llmProvider.shouldFail = false;
+    
+    // Clear all event listeners
+    this.tabs.listeners.onCreated.length = 0;
+    this.tabs.listeners.onUpdated.length = 0;
+    this.tabs.listeners.onRemoved.length = 0;
+    this.tabs.listeners.onActivated.length = 0;
+    this.tabGroups.listeners.onCreated.length = 0;
+    this.tabGroups.listeners.onUpdated.length = 0;
+    this.tabGroups.listeners.onRemoved.length = 0;
+    this.tabGroups.listeners.onMoved.length = 0;
   }
 
   _generateTitleFromUrl(url) {
