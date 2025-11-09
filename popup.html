@@ -2,74 +2,34 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <style>
-    body {
-      width: 300px;
-      padding: 20px;
-      font-family: Arial, sans-serif;
-    }
-    h1 {
-      font-size: 18px;
-      margin-bottom: 15px;
-    }
-    p {
-      font-size: 14px;
-      margin-bottom: 10px;
-    }
-    .status {
-      padding: 10px;
-      background-color: #f0f0f0;
-      border-radius: 4px;
-      margin-top: 10px;
-    }
-    button {
-      background-color: #4285f4;
-      color: white;
-      border: none;
-      padding: 8px 12px;
-      border-radius: 4px;
-      cursor: pointer;
-      margin-top: 10px;
-      width: 100%;
-      margin-bottom: 5px;
-    }
-    button:hover {
-      background-color: #3367d6;
-    }
-    .control-group {
-      margin-top: 15px;
-      padding: 10px;
-      border: 1px solid #ddd;
-      border-radius: 4px;
-    }
-    .control-group h3 {
-      margin-top: 0;
-      margin-bottom: 10px;
-      font-size: 14px;
-    }
-    select, input {
-      width: 100%;
-      padding: 5px;
-      margin-bottom: 5px;
-      box-sizing: border-box;
-    }
-    .settings-link {
-      display: block;
-      text-align: center;
-      color: #4285f4;
-      text-decoration: none;
-      margin-top: 10px;
-      font-size: 12px;
-    }
-    .settings-link:hover {
-      text-decoration: underline;
-    }
-  </style>
+  <link rel="stylesheet" href="styles.css">
 </head>
 <body>
-  <h1>AI Tab Grouper</h1>
-  <p>Your AI-powered tab grouping assistant is running.</p>
-  
+  <h1>TabStorm</h1>
+
+  <!-- Activity Indicator -->
+  <div id="activity-section">
+    <div id="activity-indicator" class="activity-idle">
+      <span id="activity-icon">✅</span>
+      <span id="activity-text">Idle</span>
+    </div>
+    <div id="batch-info" style="display: none;">
+      <span id="pending-count">0</span> tabs queued
+      <button id="group-now-btn" class="small-btn">Group Now</button>
+    </div>
+  </div>
+
+  <!-- Error Section -->
+  <div id="error-section" style="display: none;">
+    <div class="error-banner">
+      <span id="error-icon">⚠️</span>
+      <div id="error-content">
+        <div id="error-message"></div>
+        <div id="error-actions"></div>
+      </div>
+    </div>
+  </div>
+
   <div class="status">
     <p><strong>Status:</strong> <span id="extensionStatus">Active</span></p>
     <p>Current window has <span id="tabCount">0</span> tabs</p>
