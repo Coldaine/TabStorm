@@ -88,6 +88,25 @@ if (typeof chrome !== 'undefined' && chrome.runtime) {
       console.log('LLM provider updated to:', message.provider);
       sendResponse({status: 'LLM provider updated'});
       return true;
+    } else if (message.action === 'getStatus') {
+      const batchTimeout = tabGrouper.batchTimer ? Date.now() + tabGrouper.batchDelay : null;
+      sendResponse({
+        batchPending: tabGrouper.pendingTabs.size > 0,
+        pendingCount: tabGrouper.pendingTabs.size,
+        apiCallInProgress: tabGrouper.currentApiCall !== null,
+        batchTimeout: batchTimeout,
+        groupingMode: tabGrouper.groupingMode,
+        useMock: tabGrouper.useMock
+      });
+      return true;
+    } else if (message.action === 'groupNow') {
+      if (tabGrouper.pendingTabs.size > 0) {
+        tabGrouper.processPendingTabs();
+        sendResponse({status: 'Processing batch now'});
+      } else {
+        sendResponse({status: 'No pending tabs'});
+      }
+      return true;
     }
     return false;
   });
@@ -156,6 +175,7 @@ class AITabGrouper {
     this.pendingTabs = new Map();
     this.batchTimer = null;
     this.batchDelay = 2000; // 2 seconds for batching
+    this.currentApiCall = null; // Track current API call promise
 
     // Notification action mapping
     this.notificationActions = new Map();
@@ -580,22 +600,35 @@ class AITabGrouper {
       // Use mock response for testing (with the first tab for simplicity)
       return this.getMockGroupingResponse(tabs[0], allTabs, existingGroups);
     }
-    
+
     // Build prompt for the LLM with content information
     const prompt = this.buildGroupingPrompt(tabs, allTabs, existingGroups, tabsContent);
-    
+
     try {
+      // Track API call for status reporting
+      this.currentApiCall = {
+        startTime: Date.now(),
+        tabCount: tabs.length
+      };
+
       // Call OpenAI, Claude, or other API
       const responseText = await this.callExternalLLM(prompt);
       if (!responseText) {
         throw new Error(`LLM provider ${this.llmProvider} returned no usable content`);
       }
       const parsedResponse = this.parseLLMResponse(responseText);
-      
+
       // Validate and enhance the response
-      return this.validateGroupingResponse(parsedResponse, existingGroups);
+      const result = this.validateGroupingResponse(parsedResponse, existingGroups);
+
+      // Clear API call tracking
+      this.currentApiCall = null;
+
+      return result;
     } catch (error) {
       console.error('Error calling external LLM:', error);
+      // Clear API call tracking
+      this.currentApiCall = null;
       // Re-throw to trigger fallback classification
       throw error;
     }

@@ -1,7 +1,7 @@
 // popup.js
 document.addEventListener('DOMContentLoaded', async () => {
   console.log('AI Tab Grouper popup loaded');
-  
+
   const tabCountElement = document.getElementById('tabCount');
   const groupCountElement = document.getElementById('groupCount');
   const extensionStatusElement = document.getElementById('extensionStatus');
@@ -10,8 +10,17 @@ document.addEventListener('DOMContentLoaded', async () => {
   const toggleGroupingBtn = document.getElementById('toggleGroupingBtn');
   const groupingModeSelect = document.getElementById('groupingMode');
   const llmProviderSelect = document.getElementById('llmProvider');
-  
+
+  // Activity indicator elements
+  const activityIndicator = document.getElementById('activity-indicator');
+  const activityIcon = document.getElementById('activity-icon');
+  const activityText = document.getElementById('activity-text');
+  const batchInfo = document.getElementById('batch-info');
+  const pendingCountElement = document.getElementById('pending-count');
+  const groupNowBtn = document.getElementById('group-now-btn');
+
   let isGroupingEnabled = true;
+  let statusPollInterval = null;
   
   // Function to update stats
   async function updateStats() {
@@ -63,9 +72,58 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
   
+  // Function to update activity indicator based on status
+  async function updateActivityIndicator() {
+    try {
+      const response = await chrome.runtime.sendMessage({ action: 'getStatus' });
+
+      if (response.batchPending) {
+        // Batching mode
+        activityIndicator.className = 'activity-batching';
+        activityIcon.textContent = '⏳';
+        activityText.textContent = `Batching ${response.pendingCount} tabs`;
+        batchInfo.style.display = 'flex';
+        pendingCountElement.textContent = response.pendingCount;
+      } else if (response.apiCallInProgress) {
+        // Analyzing mode
+        activityIndicator.className = 'activity-analyzing';
+        activityIcon.textContent = '🤖';
+        activityText.textContent = 'Analyzing...';
+        batchInfo.style.display = 'none';
+      } else {
+        // Idle mode
+        activityIndicator.className = 'activity-idle';
+        activityIcon.textContent = '✅';
+        if (response.useMock) {
+          activityText.textContent = 'Idle (Mock Mode)';
+        } else {
+          activityText.textContent = 'Idle';
+        }
+        batchInfo.style.display = 'none';
+      }
+    } catch (error) {
+      console.error('Error updating activity indicator:', error);
+    }
+  }
+
+  // Group Now button handler
+  groupNowBtn.addEventListener('click', async () => {
+    try {
+      await chrome.runtime.sendMessage({ action: 'groupNow' });
+      // Immediately update status
+      await updateActivityIndicator();
+    } catch (error) {
+      console.error('Error triggering immediate grouping:', error);
+    }
+  });
+
   // Initial update
   await updateStats();
   await loadSettings();
+  await updateActivityIndicator();
+
+  // Start polling for status updates every 500ms
+  statusPollInterval = setInterval(updateActivityIndicator, 500);
   
   // Refresh button event
   refreshBtn.addEventListener('click', updateStats);
