@@ -1,5 +1,4 @@
 // background.js
-console.log("AI Tab Grouper background service worker loaded");
 
 // For testing: chrome will be set by the constructor
 let chrome;
@@ -73,19 +72,16 @@ if (typeof chrome !== 'undefined' && chrome.runtime) {
       }
       const hasKey = tabGrouper.resolveApiKey(tabGrouper.llmProvider);
       tabGrouper.useMock = !hasKey;
-      console.log('API key updated from options page');
       sendResponse({status: 'API key updated'});
       return true; // Indicates we wish to send a response asynchronously
     } else if (message.action === 'updateGroupingMode') {
       tabGrouper.groupingMode = message.mode;
-      console.log('Grouping mode updated to:', message.mode);
       sendResponse({status: 'Grouping mode updated'});
       return true;
     } else if (message.action === 'updateLlmProvider') {
       tabGrouper.llmProvider = message.provider;
       const hasKey = tabGrouper.resolveApiKey(tabGrouper.llmProvider);
       tabGrouper.useMock = !hasKey;
-      console.log('LLM provider updated to:', message.provider);
       sendResponse({status: 'LLM provider updated'});
       return true;
     }
@@ -99,16 +95,12 @@ class AITabGrouper {
     if (chromeApis) {
       chrome = chromeApis;
     } else if (typeof globalThis !== 'undefined' && globalThis.chrome) {
-      console.error('Setting chrome from globalThis.chrome');
       chrome = globalThis.chrome;
     } else if (typeof global !== 'undefined' && global.chrome) {
-      console.error('Setting chrome from global.chrome');
       chrome = global.chrome;
     } else if (typeof window !== 'undefined' && window.chrome) {
-      console.error('Setting chrome from window.chrome');
       chrome = window.chrome;
     } else {
-      console.error('No chrome found, leaving undefined');
     }
     this.groupingRules = [
       { 
@@ -190,7 +182,6 @@ class AITabGrouper {
         // but for now we'll just check during tab analysis
       }
     } catch (error) {
-      console.error('Error loading settings in background:', error);
     }
   }
 
@@ -202,26 +193,22 @@ class AITabGrouper {
 
     // Monitor new tabs
     chrome.tabs.onCreated.addListener((tab) => {
-      console.log('New tab created:', tab.id, tab.url);
       this.scheduleTabAnalysis(tab);
     });
     
     // Monitor tab updates (URL changes, loading completion)
     chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       if (changeInfo.status === 'complete' && changeInfo.url) {
-        console.log('Tab updated with new URL:', tab.url);
         this.scheduleTabAnalysis(tab);
       }
     });
     
     // Monitor tab activation for context
     chrome.tabs.onActivated.addListener((activeInfo) => {
-      console.log('Tab activated:', activeInfo.tabId);
     });
     
     // Monitor tab removal
     chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
-      console.log('Tab removed:', tabId);
       const timer = this.analysisTimers.get(tabId);
       if (timer) {
         clearTimeout(timer);
@@ -230,7 +217,6 @@ class AITabGrouper {
       // Also remove from pending batch
       if (this.pendingTabs.has(tabId)) {
         this.pendingTabs.delete(tabId);
-        console.log(`Tab ${tabId} removed from pending batch.`);
       }
     });
 
@@ -262,15 +248,12 @@ class AITabGrouper {
   }
 
   scheduleTabAnalysis(tab) {
-    console.log(`scheduleTabAnalysis called for tab:`, tab);
     if (!tab || typeof tab.id === 'undefined' || !this.isProcessableTab(tab)) {
-      console.log(`Tab not processable:`, { tab, processable: this.isProcessableTab(tab) });
       return;
     }
 
     // Add tab to the pending batch
     this.pendingTabs.set(tab.id, tab);
-    console.log(`Tab ${tab.id} added to batch. Pending tabs: ${this.pendingTabs.size}`);
 
     // If a batch timer is already running, clear it to reset the delay
     if (this.batchTimer) {
@@ -304,7 +287,6 @@ class AITabGrouper {
           validTabs.push(latestTabState);
         }
       } catch (e) {
-        console.error(`Tab ${tab.id} no longer exists, removing from batch:`, e);
       }
     }
 
@@ -316,19 +298,16 @@ class AITabGrouper {
   async handleNotificationClick(notificationId) {
     const action = this.notificationActions.get(notificationId);
     if (action) {
-      console.log(`Notification ${notificationId} clicked, executing grouping action.`);
       try {
         // The action contains the tab(s) and the grouping decision
         await this.executeGrouping(action.tabs, action.decision);
       } catch (error) {
-        console.error('Error executing grouping from notification click:', error);
       } finally {
         // Clean up the stored action and the notification itself
         this.notificationActions.delete(notificationId);
         chrome.notifications.clear(notificationId);
       }
     } else {
-      console.log(`No action found for clicked notification: ${notificationId}`);
     }
   }
 
@@ -338,7 +317,6 @@ class AITabGrouper {
     }
 
     if (tab.incognito) {
-      console.log(`Skipping incognito tab ${tab.id}`);
       return false;
     }
 
@@ -349,7 +327,6 @@ class AITabGrouper {
 
     const disallowedProtocols = ['chrome:', 'edge:', 'about:', 'chrome-extension:', 'devtools:'];
     if (disallowedProtocols.some((protocol) => url.startsWith(protocol))) {
-      console.log(`Skipping unsupported URL for tab ${tab.id}: ${url}`);
       return false;
     }
 
@@ -467,14 +444,12 @@ class AITabGrouper {
     let groupsInWindow = [];
 
     try {
-      console.log(`Analyzing batch of ${tabs.length} tabs, starting with: ${primaryTab.title} (${primaryTab.url})`);
 
       const settings = await chrome.storage.sync.get(['groupingMode', 'groupingPaused']);
       const groupingMode = settings.groupingMode || 'auto';
       const groupingPaused = settings.groupingPaused || false;
 
       if (groupingPaused || groupingMode === 'disabled') {
-        console.log(`Grouping is ${groupingPaused ? 'paused' : 'disabled'}, skipping batch.`);
         return;
       }
 
@@ -500,7 +475,6 @@ class AITabGrouper {
             tabsContent.push(null);
           }
         } catch (contentError) {
-          console.log(`Content script execution failed for tab ${tab.id}:`, contentError.message);
           tabsContent.push(null);
         }
       }
@@ -509,10 +483,8 @@ class AITabGrouper {
 
       if (groupingMode === 'manual') {
         if (groupDecision.shouldGroup) {
-          console.log(`Manual mode: Sending notification for grouping suggestion.`);
           await this.sendGroupingNotification(tabs, groupDecision);
         } else {
-          console.log(`Manual mode: LLM decided not to group, no notification sent.`);
         }
         return;
       }
@@ -520,10 +492,8 @@ class AITabGrouper {
       if (groupDecision.shouldGroup) {
         await this.executeGrouping(tabs, groupDecision);
       } else {
-        console.log(`Batch of ${tabs.length} tabs should not be grouped according to LLM.`);
       }
     } catch (error) {
-      console.error('Error during batch tab analysis and grouping:', error);
       // Fallback: classify all tabs in the batch and group matching ones
       try {
         const matchingTabs = [];
@@ -550,7 +520,6 @@ class AITabGrouper {
           await this.executeGrouping(matchingTabs, fallbackGroupDecision);
         }
       } catch (fallbackError) {
-        console.error('Error during fallback classification:', fallbackError);
       }
     }
   }
@@ -571,7 +540,6 @@ class AITabGrouper {
       priority: 2
     });
 
-    console.log(`Sent notification ${notificationId} for grouping ${tabCount} tabs into "${groupName}".`);
   }
 
   // New method: Call LLM API for grouping decision
@@ -595,7 +563,6 @@ class AITabGrouper {
       // Validate and enhance the response
       return this.validateGroupingResponse(parsedResponse, existingGroups);
     } catch (error) {
-      console.error('Error calling external LLM:', error);
       // Re-throw to trigger fallback classification
       throw error;
     }
@@ -759,7 +726,6 @@ If the tabs do not share a common theme or should not be grouped:
       
       if (timeSinceLastCall < this.minDelayBetweenCalls) {
         const delay = this.minDelayBetweenCalls - timeSinceLastCall;
-        console.log(`Waiting ${delay}ms to respect minimum delay between API calls`);
         await new Promise(resolve => setTimeout(resolve, delay));
       }
     }
@@ -778,7 +744,6 @@ If the tabs do not share a common theme or should not be grouped:
       try {
         if (attempt > 0) {
           const delay = Math.pow(2, attempt - 1) * 1000; // 1s, 2s, 4s
-          console.log(`[AITabGrouper] LLM call failed. Retrying attempt ${attempt + 1}/${maxRetries + 1} in ${delay / 1000}s...`);
           await new Promise(resolve => setTimeout(resolve, delay));
         }
 
@@ -885,11 +850,9 @@ If the tabs do not share a common theme or should not be grouped:
         return content; // Success
       } catch (error) {
         lastError = error;
-        console.error(`[AITabGrouper] LLM API call attempt ${attempt + 1} failed:`, error.message);
 
         // Non-retriable auth errors
         if (error.status === 401 || error.status === 403) {
-          console.error(`[AITabGrouper] Authentication error (${error.status}). Aborting retries.`);
           break; // Exit loop immediately
         }
         
@@ -905,7 +868,6 @@ If the tabs do not share a common theme or should not be grouped:
     }
 
     // If we exit the loop, all retries have failed.
-    console.error(`[AITabGrouper] LLM API call failed after ${maxRetries + 1} attempts.`);
     this.apiCallHistory.pop(); // Remove the failed call from history
     throw lastError; // Throw the last captured error
   }
@@ -928,7 +890,6 @@ If the tabs do not share a common theme or should not be grouped:
         };
       }
     } catch (error) {
-      console.error('Error parsing LLM response:', error);
       return {
         shouldGroup: false,
         reasoning: `Error parsing response: ${error.message}`
@@ -938,7 +899,6 @@ If the tabs do not share a common theme or should not be grouped:
 
   // Mock response for testing
   getMockGroupingResponse(tab, allTabs, existingGroups) {
-    console.log('Using mock response for tab:', tab.url);
     
     // Simple mock logic - could be expanded for more sophisticated testing
     const hostname = new URL(tab.url).hostname.toLowerCase();
@@ -985,7 +945,6 @@ If the tabs do not share a common theme or should not be grouped:
       for (const rule of this.groupingRules) {
         for (const pattern of rule.patterns) {
           if (hostname.includes(pattern) || pathname.includes(pattern)) {
-            console.log(`Tab ${tab.id} matches rule: ${rule.name} (${pattern})`);
             
             // Check if there's already an existing group with this rule's name
             let existingGroup = null;
@@ -1013,7 +972,6 @@ If the tabs do not share a common theme or should not be grouped:
         for (const rule of this.groupingRules) {
           for (const keyword of rule.patterns) {
             if (title.includes(keyword)) {
-              console.log(`Tab ${tab.id} matches rule by title: ${rule.name} (${keyword})`);
               
               // Check if there's already an existing group with this rule's name
               let existingGroup = null;
@@ -1042,7 +1000,6 @@ If the tabs do not share a common theme or should not be grouped:
         reasoning: "No matching grouping rules found for this tab"
       };
     } catch (error) {
-      console.error('Error classifying tab:', error);
       return {
         shouldGroup: false,
         reasoning: `Error during classification: ${error.message}`
@@ -1059,7 +1016,6 @@ If the tabs do not share a common theme or should not be grouped:
 
     if (decision.existingGroupId) {
       // Add to existing group
-      console.log(`Adding ${tabIds.length} tabs to existing group ${decision.existingGroupId}`);
       groupId = decision.existingGroupId;
       await chrome.tabs.group({
         tabIds: tabIds,
@@ -1067,16 +1023,13 @@ If the tabs do not share a common theme or should not be grouped:
       });
     } else {
       // Create new group
-      console.log(`Creating new group for ${tabIds.length} tabs.`);
       groupId = await chrome.tabs.group({ tabIds: tabIds });
       await chrome.tabGroups.update(groupId, {
         title: decision.groupName,
         color: decision.color || 'grey'
       });
-      console.log(`Updated new group ${groupId} with title "${decision.groupName}" and color "${decision.color}"`);
     }
     
-    console.log(`Successfully grouped ${tabIds.length} tabs into group ${groupId}`);
   }
 }
 
@@ -1095,14 +1048,12 @@ async function initializeTabGrouper() {
 
     await tabGrouper.loadSettings();
   } catch (error) {
-    console.error('Failed to load initial settings:', error);
   }
 }
 
 // Initialize the AI Tab Grouper only if chrome APIs are available
 if (typeof chrome !== 'undefined' && chrome.storage) {
   initializeTabGrouper().catch((error) => {
-    console.error('Error initializing AI Tab Grouper:', error);
   });
 }
 
