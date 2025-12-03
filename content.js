@@ -89,4 +89,3 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   return true;
 });
 
-console.log('AI Tab Grouper content script loaded on:', window.location.href);

@@ -1,6 +1,5 @@
 // popup.js
 document.addEventListener('DOMContentLoaded', async () => {
-  console.log('AI Tab Grouper popup loaded');
   
   const tabCountElement = document.getElementById('tabCount');
   const groupCountElement = document.getElementById('groupCount');
